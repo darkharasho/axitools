@@ -46,6 +46,10 @@ class BridgeSendQueue:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self.run())
 
+    def is_running(self) -> bool:
+        """Whether the consumer task is alive and able to drain submissions."""
+        return self._task is not None and not self._task.done()
+
     async def submit(self, channel, payload: dict, files=None) -> None:
         """Enqueue a send. Raises ``asyncio.QueueFull`` if the backlog is full."""
         self._queue.put_nowait((channel, payload, files))

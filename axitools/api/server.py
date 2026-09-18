@@ -280,6 +280,12 @@ async def _handle_bridge_whoami(request: web.Request) -> web.Response:
 
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+# Explicit guard rather than relying on aiohttp's client_max_size default
+# (1 MiB): that's a framework-wide setting a future, unrelated change could
+# raise or lower, and Discord's own attachment ceiling (10 files, 8 MiB each
+# for a non-boosted server) is the limit that actually matters here.
+MAX_BRIDGE_ATTACHMENTS = 10
+MAX_BRIDGE_ATTACHMENT_BYTES = 8 * 1024 * 1024
 
 
 async def _parse_bridge_report_body(request: web.Request):
@@ -317,7 +323,22 @@ async def _parse_bridge_report_body(request: web.Request):
         for key, value in fields.items():
             if key == "payload_json" or not isinstance(value, web.FileField):
                 continue
+            if len(files) >= MAX_BRIDGE_ATTACHMENTS:
+                return None, web.json_response(
+                    {"error": f"too many attachments (max {MAX_BRIDGE_ATTACHMENTS})"},
+                    status=400,
+                )
             data = value.file.read()
+            if len(data) > MAX_BRIDGE_ATTACHMENT_BYTES:
+                return None, web.json_response(
+                    {
+                        "error": (
+                            f"attachment {value.filename!r} exceeds "
+                            f"{MAX_BRIDGE_ATTACHMENT_BYTES} bytes"
+                        )
+                    },
+                    status=400,
+                )
             if not data.startswith(PNG_MAGIC):
                 return None, web.json_response(
                     {"error": f"attachment {value.filename!r} must be a PNG"},
@@ -358,6 +379,16 @@ async def _handle_bridge_report(request: web.Request) -> web.Response:
             {"error": "the paired channel no longer exists"}, status=403
         )
 
+    # No inline-send fallback: a report must go through the queue so the
+    # actual Discord send is never made from inside this request. If the
+    # queue isn't up (e.g. a startup race, or it crashed), fail loudly with
+    # 503 rather than silently reverting to a blocking inline send.
+    queue = getattr(bot, "bridge_queue", None)
+    if queue is None or not queue.is_running():
+        return web.json_response(
+            {"error": "bridge relay is not ready, try again shortly"}, status=503
+        )
+
     body, files = await _parse_bridge_report_body(request)
     if body is None:
         return files  # an error web.Response, per _parse_bridge_report_body's contract
@@ -370,18 +401,14 @@ async def _handle_bridge_report(request: web.Request) -> web.Response:
     registry = getattr(bot, "emoji_registry", {}) or {}
     payload = enforce_limits(substitute_payload(payload, registry))
 
-    queue = getattr(bot, "bridge_queue", None)
-    if queue is None:
-        await bot.send_bridge_report(channel, payload, files or None)
-    else:
-        try:
-            await queue.submit(channel, payload, files or None)
-        except asyncio.QueueFull:
-            return web.json_response(
-                {"error": "relay backlog is full"},
-                status=429,
-                headers={"Retry-After": "30"},
-            )
+    try:
+        await queue.submit(channel, payload, files or None)
+    except asyncio.QueueFull:
+        return web.json_response(
+            {"error": "relay backlog is full"},
+            status=429,
+            headers={"Retry-After": "30"},
+        )
     return web.json_response({"queued": True}, status=202)
 
 

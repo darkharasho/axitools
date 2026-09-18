@@ -60,11 +60,11 @@ class AxiToolsBot(commands.Bot):
         await self.load_extension("axitools.cogs.streaming")
         await self.load_extension("axitools.cogs.dev")
 
-        try:
-            self._api_runner = await start_api(self)
-        except OSError as exc:
-            LOGGER.warning("AxiTools API failed to start: %s", exc)
-
+        # The bridge queue (and emoji registry) must exist and be running
+        # BEFORE the HTTP API starts accepting requests. Otherwise there is a
+        # window where POST /bridge/report is reachable but bot.bridge_queue
+        # is still None, and the handler would have nowhere safe to hand the
+        # send off to.
         from .api.bridge_worker import BridgeSendQueue
         from .scripts.sync_emoji import build_registry
 
@@ -77,6 +77,11 @@ class AxiToolsBot(commands.Bot):
         except Exception:
             LOGGER.exception("could not load application emoji; tokens will degrade to names")
             self.emoji_registry = {}
+
+        try:
+            self._api_runner = await start_api(self)
+        except OSError as exc:
+            LOGGER.warning("AxiTools API failed to start: %s", exc)
 
     async def send_bridge_report(self, channel, payload: dict, files=None) -> None:
         """Send a relayed AxiBridge report as this bot."""

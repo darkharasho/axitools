@@ -1,10 +1,11 @@
+import asyncio
 import io
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
 
-from axitools.api.bridge_worker import RateLimiter
+from axitools.api.bridge_worker import BridgeSendQueue, RateLimiter
 from axitools.api.server import (
     APP_KEY_PREFIX,
     BRIDGE_KEY_PREFIX,
@@ -41,13 +42,19 @@ class FakeGuild:
 
 
 class FakeBot:
-    """Minimal stand-in for AxiToolsBot: just .storage and .guilds."""
+    """Minimal stand-in for AxiToolsBot: just .storage and .guilds.
+
+    ``bridge_queue`` mirrors the real bot's default of ``None`` until
+    something starts one — the startup-race fix means the HTTP layer must
+    treat that as "not ready" (503), never fall back to an inline send.
+    """
 
     def __init__(self, root: Path) -> None:
         self.storage = StorageManager(root)
         self.guilds = [FakeGuild(123, "Vigil Keep"), FakeGuild(456, "Durmand Priory")]
         self.emoji_registry = {}
         self.sent_payloads = []
+        self.bridge_queue = None
 
     async def send_bridge_report(self, channel, payload, files=None):
         self.sent_payloads.append(payload)
@@ -66,8 +73,19 @@ def bot(tmp_path):
 
 @pytest_asyncio.fixture
 async def api_client(aiohttp_client, bot):
+    # Mirror the fixed bot startup order: the queue must exist and be
+    # running before the server is reachable, so every test through this
+    # fixture exercises the real queued path, not a since-removed inline
+    # fallback.
+    bot.bridge_queue = BridgeSendQueue(bot)
+    bot.bridge_queue.start()
     app = build_app(bot, token="test-token")
     return await aiohttp_client(app)
+
+
+async def _drain(bot) -> None:
+    """Wait for the bot's bridge queue to finish processing submitted items."""
+    await bot.bridge_queue._queue.join()
 
 
 def _bearer(token: str) -> dict:
@@ -110,6 +128,7 @@ async def test_report_queues_and_substitutes(api_client, bridge_key, bot):
         },
     )
     assert resp.status == 202
+    await _drain(bot)
     sent = bot.sent_payloads[-1]
     assert sent["embeds"][0]["fields"][0]["value"] == (
         "<:firebrand:111111111111111111> Alice"
@@ -159,6 +178,7 @@ async def test_report_accepts_multipart_with_png(api_client, bridge_key, bot):
         "/bridge/report", headers=_bearer(bridge_key), data=form
     )
     assert resp.status == 202
+    await _drain(bot)
     assert bot.sent_payloads[-1]["content"] == "hi"
 
 
@@ -192,3 +212,150 @@ def _build_form(payload_json: dict, files):
             content_type=content_type,
         )
     return form
+
+
+# ---------------------------------------------------------------------------
+# 503: no inline-send fallback. If bridge_queue is missing or not running the
+# handler must refuse loudly rather than sending inline from the request.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_report_503_when_queue_missing(aiohttp_client, bot, bridge_key):
+    # bot fixture's bridge_queue defaults to None, unlike the api_client
+    # fixture which starts one — this reproduces the pre-queue startup window.
+    app = build_app(bot, token="test-token")
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/bridge/report", headers=_bearer(bridge_key), json={"content": "hi"}
+    )
+    assert resp.status == 503
+    assert bot.sent_payloads == []
+
+
+@pytest.mark.asyncio
+async def test_report_503_when_queue_not_started(aiohttp_client, bot, bridge_key):
+    bot.bridge_queue = BridgeSendQueue(bot)  # constructed, but .start() never called
+    app = build_app(bot, token="test-token")
+    client = await aiohttp_client(app)
+    resp = await client.post(
+        "/bridge/report", headers=_bearer(bridge_key), json={"content": "hi"}
+    )
+    assert resp.status == 503
+    assert bot.sent_payloads == []
+
+
+# ---------------------------------------------------------------------------
+# BridgeSendQueue itself: every HTTP-level test above only proves the handler
+# calls queue.submit(); none of them previously exercised the consumer loop.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSendBot:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def send_bridge_report(self, channel, payload, files=None):
+        self.calls.append((channel, payload, files))
+
+
+@pytest.mark.asyncio
+async def test_bridge_send_queue_delivers_submitted_report():
+    bot = _RecordingSendBot()
+    queue = BridgeSendQueue(bot)
+    queue.start()
+
+    channel = object()
+    payload = {"content": "hi"}
+    await queue.submit(channel, payload, files=None)
+    await queue._queue.join()
+
+    assert bot.calls == [(channel, payload, None)]
+
+
+class _FlakyOnceSendBot:
+    """Raises on the first send, then delivers normally."""
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def send_bridge_report(self, channel, payload, files=None):
+        self.calls.append(payload)
+        if len(self.calls) == 1:
+            raise RuntimeError("simulated Discord failure")
+
+
+@pytest.mark.asyncio
+async def test_bridge_send_queue_survives_send_exception():
+    bot = _FlakyOnceSendBot()
+    queue = BridgeSendQueue(bot)
+    queue.start()
+
+    await queue.submit(object(), {"content": "first"})
+    await queue._queue.join()
+    # The consumer must still be alive after a failed send.
+    assert queue.is_running()
+
+    await queue.submit(object(), {"content": "second"})
+    await queue._queue.join()
+
+    assert [p["content"] for p in bot.calls] == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_send_queue_full_backlog_raises_queue_full():
+    bot = _RecordingSendBot()
+    queue = BridgeSendQueue(bot)
+    # Don't start the consumer: fill the (shrunk) backlog to prove submit()
+    # surfaces asyncio.QueueFull rather than hanging or silently dropping.
+    queue._queue = asyncio.Queue(maxsize=1)
+
+    await queue.submit(object(), {"content": "one"})
+    with pytest.raises(asyncio.QueueFull):
+        await queue.submit(object(), {"content": "two"})
+
+
+# ---------------------------------------------------------------------------
+# Previously-untested 400 branches.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_report_400_on_malformed_top_level_json(api_client, bridge_key):
+    resp = await api_client.post(
+        "/bridge/report",
+        headers={**_bearer(bridge_key), "Content-Type": "application/json"},
+        data=b"{not valid json",
+    )
+    assert resp.status == 400
+    assert "invalid JSON body" in (await resp.json())["error"]
+
+
+@pytest.mark.asyncio
+async def test_report_400_on_multipart_missing_payload_json(api_client, bridge_key):
+    from aiohttp import FormData
+
+    form = FormData()
+    form.add_field(
+        "file", PNG_BYTES, filename="screenshot.png", content_type="image/png"
+    )
+    resp = await api_client.post(
+        "/bridge/report", headers=_bearer(bridge_key), data=form
+    )
+    assert resp.status == 400
+    assert "payload_json" in (await resp.json())["error"]
+
+
+@pytest.mark.asyncio
+async def test_report_400_on_invalid_json_inside_payload_json(api_client, bridge_key):
+    from aiohttp import FormData
+
+    form = FormData()
+    form.add_field(
+        "payload_json", "{not valid json", content_type="application/json"
+    )
+    resp = await api_client.post(
+        "/bridge/report", headers=_bearer(bridge_key), data=form
+    )
+    assert resp.status == 400
+    assert "invalid JSON in payload_json" in (await resp.json())["error"]
