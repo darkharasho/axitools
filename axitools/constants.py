@@ -8,6 +8,10 @@ from typing import Dict, Optional
 PACKAGE_ROOT = Path(__file__).resolve().parent
 MEDIA_PATH = PACKAGE_ROOT.parent / "media"
 CLASS_ICON_PATH = MEDIA_PATH / "gw2classicons"
+# Package-sourced icon set (from the gw2-class-icons npm package), used only
+# for Discord application emoji; CLASS_ICON_PATH remains the legacy set used
+# for /builds and /comps thumbnails.
+EMOJI_ICON_PATH = MEDIA_PATH / "gw2-class-icons"
 
 
 @dataclass(frozen=True)

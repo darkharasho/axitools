@@ -1,3 +1,5 @@
+import asyncio
+
 import discord
 import pytest
 
@@ -885,3 +887,45 @@ async def test_emoji_delete(guild):
 async def test_emoji_unknown_id_errors(guild):
     with pytest.raises(ValueError, match="emoji 999 not found"):
         await execute_action(None, guild, "emoji_delete", {"emoji_id": 999})
+
+
+# ---------------------------------------------------------------------------
+# N2: resolve_channel's fetch_channel fallback must swallow every documented
+# failure mode of Guild.fetch_channel, not just the HTTPException family --
+# otherwise a transient blip surfaces as a 500 instead of the spec's clean
+# None/403. asyncio.TimeoutError and aiohttp.ClientError are network-shaped
+# exception types, constructed here directly with no Discord call made.
+# ---------------------------------------------------------------------------
+
+import aiohttp
+
+from axitools.api.discord_actions import resolve_channel
+
+
+class _FetchRaisingGuild:
+    """Minimal guild double: cache miss, fetch_channel raises on every call."""
+
+    def __init__(self, guild_id: int, exc: BaseException) -> None:
+        self.id = guild_id
+        self._exc = exc
+
+    def get_channel(self, channel_id):
+        return None
+
+    async def fetch_channel(self, channel_id):
+        raise self._exc
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        discord.InvalidData("parent channel not found"),
+        aiohttp.ClientError("connection reset"),
+        asyncio.TimeoutError("timed out"),
+    ],
+)
+async def test_resolve_channel_fetch_fallback_swallows_network_exceptions(exc):
+    fake_guild = _FetchRaisingGuild(123, exc)
+    with pytest.raises(ValueError, match="not found in this server"):
+        await resolve_channel(fake_guild, 999)

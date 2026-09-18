@@ -12,6 +12,7 @@ import base64
 import calendar
 import datetime as _dt
 import hashlib
+import io
 import json
 import logging
 import os
@@ -34,6 +35,10 @@ from ..storage import (
     utcnow,
 )
 from . import discord_actions
+from .bridge_payload import validate_report
+from .bridge_worker import RateLimiter
+from .discord_actions import resolve_channel
+from ..emoji_registry import enforce_limits, substitute_payload
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +46,7 @@ DEFAULT_PORT = 8642
 DEFAULT_PUBLIC_URL = "http://127.0.0.1:8642"
 
 APP_KEY_PREFIX = "axt1."
+BRIDGE_KEY_PREFIX = "axb1."
 
 API_ACTOR_ID = 0
 
@@ -96,15 +102,60 @@ def generate_app_key(base_url: str | None = None) -> str:
     return f"{APP_KEY_PREFIX}{encoded_url}.{secret}"
 
 
+def generate_bridge_key(base_url: str | None = None) -> str:
+    """Build a channel-scoped AxiBridge key: ``axb1.<base64url(base_url)>.<secret>``."""
+    if base_url is None:
+        base_url = resolve_public_url()
+    encoded_url = base64.urlsafe_b64encode(base_url.encode("utf-8")).rstrip(b"=").decode("ascii")
+    secret = secrets.token_urlsafe(32)
+    return f"{BRIDGE_KEY_PREFIX}{encoded_url}.{secret}"
+
+
 def hash_app_key(key: str) -> str:
     """Return the sha256 hex digest of the full key string (what we persist)."""
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
+def _spawn_background(app: web.Application, coro) -> "asyncio.Task":
+    """Fire-and-forget a coroutine while keeping a reference to its task.
+
+    A bare ``asyncio.create_task(...)`` with no retained reference is only
+    weakly held by the event loop and can be garbage-collected mid-flight.
+    ``app["_background_tasks"]`` keeps it alive until it finishes.
+    """
+    task = asyncio.create_task(coro)
+    tasks: set = app["_background_tasks"]
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
+
+
 @web.middleware
 async def _auth_middleware(request: web.Request, handler):
-    expected = f"Bearer {request.app['api_token']}"
     supplied = request.headers.get("Authorization", "")
+    bearer = supplied[len("Bearer "):] if supplied.startswith("Bearer ") else ""
+
+    # Bridge routes are reachable only with an axb1 key, and an axb1 key is
+    # reachable only on bridge routes. This mutual exclusion is the security
+    # boundary that keeps a desktop app's plaintext credential harmless.
+    # An exact-or-child-segment match, not a bare prefix: a future unrelated
+    # route like /bridgekeys must not silently inherit bridge-only auth.
+    is_bridge_path = request.path == "/bridge" or request.path.startswith("/bridge/")
+    if is_bridge_path or bearer.startswith(BRIDGE_KEY_PREFIX):
+        if not (is_bridge_path and bearer.startswith(BRIDGE_KEY_PREFIX)):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        bot = request.app["bot"]
+        token_hash = hash_app_key(bearer)
+        scope = await asyncio.to_thread(bot.storage.get_bridge_key_scope, token_hash)
+        if scope is None:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        _spawn_background(
+            request.app, asyncio.to_thread(bot.storage.touch_bridge_key, token_hash)
+        )
+        request["bridge_scope"] = scope
+        return await handler(request)
+
+    expected = f"Bearer {request.app['api_token']}"
     if request.app["allow_global_token"] and secrets.compare_digest(
         supplied.encode(), expected.encode()
     ):
@@ -113,7 +164,6 @@ async def _auth_middleware(request: web.Request, handler):
         # rejected as an unknown bearer below.
         return await handler(request)
 
-    bearer = supplied[len("Bearer "):] if supplied.startswith("Bearer ") else ""
     if not bearer.startswith(APP_KEY_PREFIX):
         return web.json_response({"error": "unauthorized"}, status=401)
 
@@ -220,6 +270,218 @@ async def _handle_guilds(request: web.Request) -> web.Response:
     if scoped_guild_id is not None:
         guilds = [g for g in guilds if g.id == scoped_guild_id]
     return web.json_response([{"id": _sid(g.id), "name": g.name} for g in guilds])
+
+
+def _bot_can_send(channel, guild) -> bool:
+    """Whether the bot can post in *channel*, defensively.
+
+    A missing ``guild.me`` or ``channel.permissions_for`` (a lightweight test
+    double, or an unusual channel type discord.py cannot compute permissions
+    for) is treated as "unknown, don't block" -- this check exists to turn
+    the common, static "Axi can see but not post in this channel" case (I2)
+    into an early, specific error, not to become a new way to reject an
+    otherwise-working channel.
+    """
+    me = getattr(guild, "me", None)
+    permissions_for = getattr(channel, "permissions_for", None)
+    if me is None or permissions_for is None:
+        return True
+    try:
+        perms = permissions_for(me)
+        if isinstance(channel, discord.Thread):
+            return bool(perms.send_messages_in_threads)
+        return bool(perms.send_messages)
+    except Exception:
+        return True
+
+
+async def _handle_bridge_whoami(request: web.Request) -> web.Response:
+    """Identify the guild and channel a bridge key is bound to, for paste-time
+    validation in AxiBridge."""
+    guild_id, channel_id = request["bridge_scope"]
+    bot = request.app["bot"]
+    guild = discord.utils.get(bot.guilds, id=guild_id)
+    if guild is None:
+        return web.json_response(
+            {"error": "the bot is no longer in that server"}, status=403
+        )
+    # Same resolver the report path uses (I4): whoami used to be a plain
+    # guild.get_channel, which never returns a thread, so a pairing made
+    # inside a thread would validate at pair time and then report itself
+    # "deleted" the moment the user pasted the key.
+    try:
+        channel = await resolve_channel(guild, channel_id)
+    except ValueError:
+        return web.json_response(
+            {"error": "the paired channel no longer exists"}, status=403
+        )
+    if not _bot_can_send(channel, guild):
+        return web.json_response(
+            {"error": "the bot cannot send messages in the paired channel"},
+            status=403,
+        )
+    return web.json_response(
+        {
+            "guild_id": str(guild_id),
+            "guild_name": guild.name,
+            "channel_id": str(channel_id),
+            "channel_name": getattr(channel, "name", str(channel_id)),
+        }
+    )
+
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+# Named after Discord's own attachment ceiling (10 files, 8 MiB each for a
+# non-boosted server), NOT a ceiling this server actually delivers today:
+# build_app() does not raise aiohttp's client_max_size (default 1 MiB), so in
+# practice any body over ~1 MiB gets aiohttp's generic 413 before this check
+# ever runs. AxiBridge's only current bridge payload class is JSON embeds
+# (well under 1 MiB); this constant and the per-file check below only matter
+# once image mode (which posts multipart with PNG attachments) gets a caller
+# again -- raise client_max_size in the same change that revives it.
+MAX_BRIDGE_ATTACHMENTS = 10
+MAX_BRIDGE_ATTACHMENT_BYTES = 8 * 1024 * 1024
+
+
+async def _parse_bridge_report_body(request: web.Request):
+    """Return ``(json_body, files)`` or ``(None, error_response)``.
+
+    Accepts a plain JSON body, or ``multipart/form-data`` with a
+    ``payload_json`` part plus PNG file parts — AxiBridge's image mode posts
+    FormData (``src/main/discord.ts:310``), so a screenshot-attached bridged
+    send must not 400 just because it isn't bare JSON.
+    """
+    content_type = request.content_type or ""
+    if content_type == "multipart/form-data":
+        fields = await request.post()
+        raw_payload = fields.get("payload_json")
+        if raw_payload is None:
+            return None, web.json_response(
+                {"error": "multipart request missing payload_json part"}, status=400
+            )
+        try:
+            body = json.loads(
+                raw_payload
+                if isinstance(raw_payload, str)
+                else raw_payload.decode("utf-8")
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None, web.json_response(
+                {"error": "invalid JSON in payload_json part"}, status=400
+            )
+        if not isinstance(body, dict):
+            return None, web.json_response(
+                {"error": "invalid JSON in payload_json part"}, status=400
+            )
+
+        files = []
+        for key, value in fields.items():
+            if key == "payload_json" or not isinstance(value, web.FileField):
+                continue
+            if len(files) >= MAX_BRIDGE_ATTACHMENTS:
+                return None, web.json_response(
+                    {"error": f"too many attachments (max {MAX_BRIDGE_ATTACHMENTS})"},
+                    status=400,
+                )
+            data = value.file.read()
+            if len(data) > MAX_BRIDGE_ATTACHMENT_BYTES:
+                return None, web.json_response(
+                    {
+                        "error": (
+                            f"attachment {value.filename!r} exceeds "
+                            f"{MAX_BRIDGE_ATTACHMENT_BYTES} bytes"
+                        )
+                    },
+                    status=400,
+                )
+            if not data.startswith(PNG_MAGIC):
+                return None, web.json_response(
+                    {"error": f"attachment {value.filename!r} must be a PNG"},
+                    status=400,
+                )
+            files.append(discord.File(io.BytesIO(data), filename=value.filename))
+        return body, files
+
+    body = await _parse_json_body(request)
+    if body is None:
+        return None, web.json_response({"error": "invalid JSON body"}, status=400)
+    return body, []
+
+
+async def _handle_bridge_report(request: web.Request) -> web.Response:
+    guild_id, channel_id = request["bridge_scope"]
+    bot = request.app["bot"]
+
+    supplied = request.headers.get("Authorization", "")
+    key_hash = hash_app_key(supplied[len("Bearer "):])
+    retry_after = request.app["bridge_rate_limiter"].check(key_hash)
+    if retry_after is not None:
+        return web.json_response(
+            {"error": "rate limited"},
+            status=429,
+            headers={"Retry-After": str(int(retry_after))},
+        )
+
+    guild = discord.utils.get(bot.guilds, id=guild_id)
+    if guild is None:
+        return web.json_response(
+            {"error": "the bot is no longer in that server"}, status=403
+        )
+    try:
+        channel = await resolve_channel(guild, channel_id)
+    except ValueError:
+        return web.json_response(
+            {"error": "the paired channel no longer exists"}, status=403
+        )
+    if not _bot_can_send(channel, guild):
+        # I2: without this, a channel where Axi has View Channel but not Send
+        # Messages (a locked announcements channel is the common case) links
+        # cleanly, whoami reports healthy, and every report thereafter 202s
+        # and is dropped silently inside the async send worker.
+        return web.json_response(
+            {"error": "the bot cannot send messages in the paired channel"},
+            status=403,
+        )
+
+    # No inline-send fallback: a report must go through the queue so the
+    # actual Discord send is never made from inside this request. If the
+    # queue isn't up (e.g. a startup race, or it crashed), fail loudly with
+    # 503 rather than silently reverting to a blocking inline send.
+    queue = getattr(bot, "bridge_queue", None)
+    if queue is None or not queue.is_running():
+        return web.json_response(
+            {"error": "bridge relay is not ready, try again shortly"}, status=503
+        )
+
+    body, files = await _parse_bridge_report_body(request)
+    if body is None:
+        return files  # an error web.Response, per _parse_bridge_report_body's contract
+
+    try:
+        payload = validate_report(body)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    registry = getattr(bot, "emoji_registry", {}) or {}
+    if not registry:
+        # Rate-limited lazy recovery from a boot-time registry-load failure
+        # (I3): without this, an empty registry stays empty until a restart
+        # and every report silently posts plain text instead of icons.
+        maybe_refresh = getattr(bot, "maybe_refresh_emoji_registry", None)
+        if maybe_refresh is not None:
+            await maybe_refresh()
+            registry = getattr(bot, "emoji_registry", {}) or {}
+    payload = enforce_limits(substitute_payload(payload, registry))
+
+    try:
+        await queue.submit(channel, payload, files or None)
+    except asyncio.QueueFull:
+        return web.json_response(
+            {"error": "relay backlog is full"},
+            status=429,
+            headers={"Retry-After": "30"},
+        )
+    return web.json_response({"queued": True}, status=202)
 
 
 async def _parse_json_body(request: web.Request) -> dict | None:
@@ -716,7 +978,7 @@ async def _handle_discord_messages(request: web.Request) -> web.Response:
     if window_err is not None:
         return web.json_response({"error": window_err}, status=400)
     try:
-        channel = discord_actions.resolve_channel(guild, int(target_id))
+        channel = await discord_actions.resolve_channel(guild, int(target_id))
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=404)
     # Forum and category channels hold threads / other channels, not messages, so
@@ -1618,6 +1880,8 @@ def build_app(bot, token: str) -> web.Application:
     app["bot"] = bot
     app["api_token"] = token
     app["allow_global_token"] = global_token_enabled()
+    app["bridge_rate_limiter"] = RateLimiter()
+    app["_background_tasks"] = set()
     app.router.add_get("/guilds", _handle_guilds)
     app.router.add_get("/guilds/{guild_id:\\d+}/builds", _handle_builds_list)
     app.router.add_post("/guilds/{guild_id:\\d+}/builds", _handle_builds_create)
@@ -1659,6 +1923,8 @@ def build_app(bot, token: str) -> web.Application:
     app.router.add_get("/guilds/{guild_id:\\d+}/discord/messages", _handle_discord_messages)
     app.router.add_get("/guilds/{guild_id:\\d+}/discord/actions", _handle_discord_actions_list)
     app.router.add_post("/guilds/{guild_id:\\d+}/discord/actions", _handle_discord_actions_post)
+    app.router.add_get("/bridge/whoami", _handle_bridge_whoami)
+    app.router.add_post("/bridge/report", _handle_bridge_report)
     return app
 
 

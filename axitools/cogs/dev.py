@@ -40,6 +40,71 @@ class DevCog(commands.GroupCog, name="dev", group_extras={"category": "Dev"}):
         cog = self.bot.get_cog("RssFeedsCog")
         await cog.run_test_feed(interaction)
 
+    @app_commands.command(
+        name="bridgetest",
+        description="Post a canned AxiBridge report here to check emoji spacing.",
+    )
+    async def bridgetest(self, interaction: discord.Interaction) -> None:
+        from ..emoji_registry import enforce_limits, substitute_payload
+
+        # Same no-silent-fallback rule as the HTTP relay handler: if the send
+        # queue isn't up, tell the invoker instead of quietly sending inline
+        # (which would skip the rate limiter and the worker's exception
+        # handling that real reports always go through).
+        queue = getattr(self.bot, "bridge_queue", None)
+        if queue is None or not queue.is_running():
+            await interaction.response.send_message(
+                "Bridge send queue is not running; nothing was posted.",
+                ephemeral=True,
+            )
+            return
+
+        # Deliberately unfenced: custom Discord emoji do not render inside
+        # fenced code blocks (they show as literal <:name:id> text), so the
+        # rows must stay as plain text for this smoke test to be meaningful.
+        rows = "\n".join(
+            f"{{{{spec:{spec}}}}} {i + 1:>2} Player{i:02d}  {1234 - i * 37:>5}"
+            for i, spec in enumerate(
+                ["firebrand", "scourge", "spellbreaker", "herald", "tempest"]
+            )
+        )
+        payload = {
+            "content": "**Bridge test** — canned report",
+            "embeds": [
+                {
+                    "title": "{{spec:firebrand}} Squad Summary",
+                    "color": 3447003,
+                    "fields": [
+                        {"name": "Damage", "value": rows, "inline": True},
+                        {"name": "Healing", "value": rows, "inline": True},
+                    ],
+                    "footer": {"text": "AxiBridge · /dev bridgetest"},
+                }
+            ],
+        }
+        registry = getattr(self.bot, "emoji_registry", {}) or {}
+        await queue.submit(
+            interaction.channel, enforce_limits(substitute_payload(payload, registry))
+        )
+        await interaction.response.send_message(
+            f"Queued with {len(registry)} emoji in the registry.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="emojireload",
+        description="Re-fetch application emoji from Discord and rebuild the bridge registry.",
+    )
+    async def emojireload(self, interaction: discord.Interaction) -> None:
+        # I3: setup_hook only loads the registry once, and a transient
+        # Discord failure at boot leaves it empty (every bridged report then
+        # posts plain text) until something re-fetches. This is the explicit,
+        # unrate-limited trigger for that; the HTTP path also does a rate
+        # limited version of the same fetch when the registry is empty.
+        count = await self.bot.refresh_emoji_registry()
+        await interaction.response.send_message(
+            f"Reloaded emoji registry: {count} emoji.", ephemeral=True
+        )
+
 
 async def setup(bot: AxiToolsBot) -> None:
     if not PRODUCTION:

@@ -583,6 +583,18 @@ class AppKeyInfo:
 
 
 @dataclass
+class BridgeKeyInfo:
+    """A channel-scoped AxiBridge report key."""
+
+    id: int
+    guild_id: int
+    channel_id: int
+    created_by: int
+    created_at: str
+    last_used_at: Optional[str] = None
+
+
+@dataclass
 class ApiKeyRecord:
     """Persisted Guild Wars 2 API key details for a member."""
 
@@ -726,6 +738,16 @@ class ApiKeyStore:
                     created_at TEXT NOT NULL,
                     last_used_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS bridge_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    created_by INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_bridge_keys_guild ON bridge_keys(guild_id);
                 CREATE INDEX IF NOT EXISTS idx_app_keys_guild ON app_keys(guild_id);
                 CREATE INDEX IF NOT EXISTS idx_api_keys_guild_user ON api_keys(guild_id, user_id);
                 CREATE INDEX IF NOT EXISTS idx_api_keys_guild ON api_keys(guild_id);
@@ -986,6 +1008,91 @@ class ApiKeyStore:
                 cursor = connection.execute(
                     "DELETE FROM app_keys WHERE guild_id = ? AND lower(label) = lower(?)",
                     (guild_id, label.strip()),
+                )
+            return cursor.rowcount
+
+    def add_bridge_key(
+        self, guild_id: int, channel_id: int, token_hash: str, created_by: int
+    ) -> BridgeKeyInfo:
+        """Register a channel-scoped AxiBridge key. Existing keys stay valid."""
+
+        created_at = utcnow()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO bridge_keys
+                    (guild_id, channel_id, token_hash, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (guild_id, channel_id, token_hash, created_by, created_at),
+            )
+            key_id = int(cursor.lastrowid)
+        return BridgeKeyInfo(
+            id=key_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            created_by=created_by,
+            created_at=created_at,
+        )
+
+    def get_bridge_key_scope(self, token_hash: str) -> tuple[int, int] | None:
+        """Return ``(guild_id, channel_id)`` bound to ``token_hash``, if any."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT guild_id, channel_id FROM bridge_keys WHERE token_hash = ? LIMIT 1",
+                (token_hash,),
+            ).fetchone()
+        return (int(row["guild_id"]), int(row["channel_id"])) if row else None
+
+    def touch_bridge_key(self, token_hash: str) -> None:
+        """Record that a bridge key was just used. Best-effort; never raises."""
+
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE bridge_keys SET last_used_at = ? WHERE token_hash = ?",
+                    (utcnow(), token_hash),
+                )
+        except Exception:  # logging-only path; auth must not fail on a stats write
+            logger.debug("touch_bridge_key failed", exc_info=True)
+
+    def list_bridge_keys(self, guild_id: int) -> List[BridgeKeyInfo]:
+        """All bridge keys for a guild, oldest first."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, guild_id, channel_id, created_by, created_at, last_used_at
+                FROM bridge_keys WHERE guild_id = ? ORDER BY id
+                """,
+                (guild_id,),
+            ).fetchall()
+        return [
+            BridgeKeyInfo(
+                id=int(row["id"]),
+                guild_id=int(row["guild_id"]),
+                channel_id=int(row["channel_id"]),
+                created_by=int(row["created_by"]),
+                created_at=str(row["created_at"]),
+                last_used_at=row["last_used_at"],
+            )
+            for row in rows
+        ]
+
+    def revoke_bridge_key(self, guild_id: int, key_id: Optional[int] = None) -> int:
+        """Delete bridge keys for a guild. With ``key_id`` only that key is removed;
+        without it, every key for the guild is removed. Returns rows deleted."""
+
+        with self._connect() as connection:
+            if key_id is None:
+                cursor = connection.execute(
+                    "DELETE FROM bridge_keys WHERE guild_id = ?", (guild_id,)
+                )
+            else:
+                cursor = connection.execute(
+                    "DELETE FROM bridge_keys WHERE guild_id = ? AND id = ?",
+                    (guild_id, key_id),
                 )
             return cursor.rowcount
 
@@ -2385,6 +2492,23 @@ class StorageManager:
 
     def revoke_app_key(self, guild_id: int, label: Optional[str] = None) -> int:
         return self.api_key_store.revoke_app_key(guild_id, label)
+
+    def add_bridge_key(
+        self, guild_id: int, channel_id: int, token_hash: str, created_by: int
+    ) -> BridgeKeyInfo:
+        return self.api_key_store.add_bridge_key(guild_id, channel_id, token_hash, created_by)
+
+    def get_bridge_key_scope(self, token_hash: str) -> tuple[int, int] | None:
+        return self.api_key_store.get_bridge_key_scope(token_hash)
+
+    def touch_bridge_key(self, token_hash: str) -> None:
+        self.api_key_store.touch_bridge_key(token_hash)
+
+    def list_bridge_keys(self, guild_id: int) -> List[BridgeKeyInfo]:
+        return self.api_key_store.list_bridge_keys(guild_id)
+
+    def revoke_bridge_key(self, guild_id: int, key_id: Optional[int] = None) -> int:
+        return self.api_key_store.revoke_bridge_key(guild_id, key_id)
 
     def all_gw2_guild_ids(self) -> List[str]:
         return self.api_key_store.all_gw2_guild_ids()
