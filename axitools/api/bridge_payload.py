@@ -1,0 +1,115 @@
+"""Whitelist validation for relayed AxiBridge report payloads.
+
+The relay is public, so it must never forward client-supplied JSON to Discord
+verbatim — that is an open "post anything as this bot" proxy. Only the keys a
+fight report actually uses are accepted; everything else is a hard error.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict
+
+ALLOWED_TOP_KEYS = frozenset({"content", "embeds"})
+ALLOWED_EMBED_KEYS = frozenset(
+    {"title", "description", "color", "footer", "fields", "timestamp"}
+)
+ALLOWED_FIELD_KEYS = frozenset({"name", "value", "inline"})
+ALLOWED_FOOTER_KEYS = frozenset({"text"})
+
+MAX_EMBEDS = 10
+MAX_FIELDS = 25
+MAX_CONTENT = 2000
+MAX_TEXT = 6000  # per string; enforce_limits does the per-embed accounting
+
+# Dropped silently rather than rejected: a bot cannot set them, and AxiBridge's
+# webhook path legitimately includes them.
+IGNORED_TOP_KEYS = frozenset({"username", "avatar_url"})
+
+
+def _require_str(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if len(value) > MAX_TEXT:
+        raise ValueError(f"{label} is too long")
+    return value
+
+
+def _validate_footer(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("footer must be an object")
+    unknown = set(raw) - ALLOWED_FOOTER_KEYS
+    if unknown:
+        raise ValueError(f"footer key not allowed: {sorted(unknown)[0]}")
+    return {"text": _require_str(raw.get("text", ""), "footer.text")}
+
+
+def _validate_field(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("each field must be an object")
+    unknown = set(raw) - ALLOWED_FIELD_KEYS
+    if unknown:
+        raise ValueError(f"field key not allowed: {sorted(unknown)[0]}")
+    field = {
+        "name": _require_str(raw.get("name", ""), "field.name"),
+        "value": _require_str(raw.get("value", ""), "field.value"),
+    }
+    if "inline" in raw:
+        if not isinstance(raw["inline"], bool):
+            raise ValueError("field.inline must be a boolean")
+        field["inline"] = raw["inline"]
+    return field
+
+
+def _validate_embed(raw: Any) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("each embed must be an object")
+    unknown = set(raw) - ALLOWED_EMBED_KEYS
+    if unknown:
+        raise ValueError(f"embed key not allowed: {sorted(unknown)[0]}")
+
+    embed: Dict[str, Any] = {}
+    for key in ("title", "description", "timestamp"):
+        if key in raw:
+            embed[key] = _require_str(raw[key], f"embed.{key}")
+    if "color" in raw:
+        if not isinstance(raw["color"], int) or isinstance(raw["color"], bool):
+            raise ValueError("embed.color must be an integer")
+        embed["color"] = raw["color"]
+    if "footer" in raw:
+        embed["footer"] = _validate_footer(raw["footer"])
+    if "fields" in raw:
+        if not isinstance(raw["fields"], list):
+            raise ValueError("embed.fields must be a list")
+        if len(raw["fields"]) > MAX_FIELDS:
+            raise ValueError(f"too many fields (max {MAX_FIELDS})")
+        embed["fields"] = [_validate_field(f) for f in raw["fields"]]
+    return embed
+
+
+def validate_report(body: Any) -> Dict[str, Any]:
+    """Return a whitelisted copy of *body*, or raise ``ValueError``."""
+    if not isinstance(body, dict):
+        raise ValueError("body must be a JSON object")
+
+    unknown = set(body) - ALLOWED_TOP_KEYS - IGNORED_TOP_KEYS
+    if unknown:
+        raise ValueError(f"key not allowed: {sorted(unknown)[0]}")
+
+    payload: Dict[str, Any] = {}
+    if "content" in body:
+        content = _require_str(body["content"], "content")
+        if len(content) > MAX_CONTENT:
+            raise ValueError("content is too long")
+        if "@everyone" in content or "@here" in content:
+            raise ValueError("content may not mention everyone or here")
+        payload["content"] = content
+
+    if "embeds" in body:
+        if not isinstance(body["embeds"], list):
+            raise ValueError("embeds must be a list")
+        if len(body["embeds"]) > MAX_EMBEDS:
+            raise ValueError(f"too many embeds (max {MAX_EMBEDS})")
+        payload["embeds"] = [_validate_embed(e) for e in body["embeds"]]
+
+    if not payload.get("content") and not payload.get("embeds"):
+        raise ValueError("report is empty")
+    return payload
