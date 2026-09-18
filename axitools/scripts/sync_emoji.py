@@ -1,4 +1,4 @@
-"""Sync ``media/gw2classicons`` into this application's Discord emoji.
+"""Sync ``media/gw2-class-icons`` into this application's Discord emoji.
 
 Run manually — NOT at bot startup. Application emoji are global to the
 application, so a startup uploader races every restart and every deployed
@@ -6,6 +6,16 @@ replica, and one bad asset would break boot instead of failing one command:
 
     python -m axitools.scripts.sync_emoji            # dry run
     python -m axitools.scripts.sync_emoji --apply
+
+Discord consequence of re-running after the icon source changes: ``plan_sync``
+diffs by emoji *presence* only (``to_upload`` = local keys absent remotely).
+Discord has no emoji-update endpoint, so re-running this sync after swapping
+in new art for an already-uploaded key uploads nothing for that key and does
+NOT replace the art of the emoji already uploaded — it keeps the old art until
+it is deleted and re-created. Only genuinely new keys (not previously
+uploaded) get created with the new art. Deleting and re-creating existing
+emoji to force an art refresh is a deliberate, human-approved action, not
+something this script does automatically.
 """
 from __future__ import annotations
 
@@ -21,7 +31,7 @@ from typing import Dict, List, Tuple
 import aiohttp
 from PIL import Image
 
-from ..constants import CLASS_ICON_PATH
+from ..constants import EMOJI_ICON_PATH
 from ..emoji_registry import emoji_key_for_asset
 
 LOGGER = logging.getLogger(__name__)
@@ -35,7 +45,7 @@ def normalize_icon(path: Path) -> bytes:
     """Return upload-ready PNG bytes: square, ``EMOJI_SIZE``², under the cap.
 
     Pads the shorter axis with transparency instead of stretching — the shipped
-    icons include non-square art (``Bladesworn.png`` is 572×599) and stretching
+    icons include non-square art (``Bladesworn.png`` is 150×116) and stretching
     makes it look subtly wrong.
     """
     with Image.open(path) as source:
@@ -53,8 +63,13 @@ def normalize_icon(path: Path) -> bytes:
     return data
 
 
-def load_local_icons(directory: Path = CLASS_ICON_PATH) -> Dict[str, bytes]:
-    """Normalized PNG bytes for every icon, keyed by registry key."""
+def load_local_icons(directory: Path = EMOJI_ICON_PATH) -> Dict[str, bytes]:
+    """Normalized PNG bytes for every icon, keyed by registry key.
+
+    Defaults to ``EMOJI_ICON_PATH``, the package-sourced set vendored from
+    ``gw2-class-icons`` — not ``CLASS_ICON_PATH``, which is the legacy set
+    used by ``/builds`` and ``/comps`` thumbnails.
+    """
     return {
         emoji_key_for_asset(path.name): normalize_icon(path)
         for path in sorted(directory.glob("*.png"))

@@ -28,6 +28,11 @@ def emoji_key_for_asset(filename: str) -> str:
 
     Assets are bare spec/profession names (``Firebrand.png``) with one
     exception, ``Revenant_icon.png``, so a trailing ``_icon`` is stripped.
+
+    This ``_icon`` carve-out is a legacy-set quirk. The package-sourced set
+    (``media/gw2-class-icons``, used for Discord application emoji) ships
+    ``Revenant.png`` with no such suffix, so the strip is a no-op there; it
+    is kept because it is still correct for the legacy set.
     """
     stem = filename.rsplit(".", 1)[0]
     if stem.endswith("_icon"):
