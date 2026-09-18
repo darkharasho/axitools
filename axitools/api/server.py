@@ -12,6 +12,7 @@ import base64
 import calendar
 import datetime as _dt
 import hashlib
+import io
 import json
 import logging
 import os
@@ -34,6 +35,10 @@ from ..storage import (
     utcnow,
 )
 from . import discord_actions
+from .bridge_payload import validate_report
+from .bridge_worker import RateLimiter
+from .discord_actions import resolve_channel
+from ..emoji_registry import enforce_limits, substitute_payload
 
 LOGGER = logging.getLogger(__name__)
 
@@ -272,6 +277,112 @@ async def _handle_bridge_whoami(request: web.Request) -> web.Response:
             "channel_name": getattr(channel, "name", str(channel_id)),
         }
     )
+
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+async def _parse_bridge_report_body(request: web.Request):
+    """Return ``(json_body, files)`` or ``(None, error_response)``.
+
+    Accepts a plain JSON body, or ``multipart/form-data`` with a
+    ``payload_json`` part plus PNG file parts — AxiBridge's image mode posts
+    FormData (``src/main/discord.ts:310``), so a screenshot-attached bridged
+    send must not 400 just because it isn't bare JSON.
+    """
+    content_type = request.content_type or ""
+    if content_type == "multipart/form-data":
+        fields = await request.post()
+        raw_payload = fields.get("payload_json")
+        if raw_payload is None:
+            return None, web.json_response(
+                {"error": "multipart request missing payload_json part"}, status=400
+            )
+        try:
+            body = json.loads(
+                raw_payload
+                if isinstance(raw_payload, str)
+                else raw_payload.decode("utf-8")
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None, web.json_response(
+                {"error": "invalid JSON in payload_json part"}, status=400
+            )
+        if not isinstance(body, dict):
+            return None, web.json_response(
+                {"error": "invalid JSON in payload_json part"}, status=400
+            )
+
+        files = []
+        for key, value in fields.items():
+            if key == "payload_json" or not isinstance(value, web.FileField):
+                continue
+            data = value.file.read()
+            if not data.startswith(PNG_MAGIC):
+                return None, web.json_response(
+                    {"error": f"attachment {value.filename!r} must be a PNG"},
+                    status=400,
+                )
+            files.append(discord.File(io.BytesIO(data), filename=value.filename))
+        return body, files
+
+    body = await _parse_json_body(request)
+    if body is None:
+        return None, web.json_response({"error": "invalid JSON body"}, status=400)
+    return body, []
+
+
+async def _handle_bridge_report(request: web.Request) -> web.Response:
+    guild_id, channel_id = request["bridge_scope"]
+    bot = request.app["bot"]
+
+    supplied = request.headers.get("Authorization", "")
+    key_hash = hash_app_key(supplied[len("Bearer "):])
+    retry_after = request.app["bridge_rate_limiter"].check(key_hash)
+    if retry_after is not None:
+        return web.json_response(
+            {"error": "rate limited"},
+            status=429,
+            headers={"Retry-After": str(int(retry_after))},
+        )
+
+    guild = discord.utils.get(bot.guilds, id=guild_id)
+    if guild is None:
+        return web.json_response(
+            {"error": "the bot is no longer in that server"}, status=403
+        )
+    try:
+        channel = resolve_channel(guild, channel_id)
+    except ValueError:
+        return web.json_response(
+            {"error": "the paired channel no longer exists"}, status=403
+        )
+
+    body, files = await _parse_bridge_report_body(request)
+    if body is None:
+        return files  # an error web.Response, per _parse_bridge_report_body's contract
+
+    try:
+        payload = validate_report(body)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    registry = getattr(bot, "emoji_registry", {}) or {}
+    payload = enforce_limits(substitute_payload(payload, registry))
+
+    queue = getattr(bot, "bridge_queue", None)
+    if queue is None:
+        await bot.send_bridge_report(channel, payload, files or None)
+    else:
+        try:
+            await queue.submit(channel, payload, files or None)
+        except asyncio.QueueFull:
+            return web.json_response(
+                {"error": "relay backlog is full"},
+                status=429,
+                headers={"Retry-After": "30"},
+            )
+    return web.json_response({"queued": True}, status=202)
 
 
 async def _parse_json_body(request: web.Request) -> dict | None:
@@ -1670,6 +1781,7 @@ def build_app(bot, token: str) -> web.Application:
     app["bot"] = bot
     app["api_token"] = token
     app["allow_global_token"] = global_token_enabled()
+    app["bridge_rate_limiter"] = RateLimiter()
     app.router.add_get("/guilds", _handle_guilds)
     app.router.add_get("/guilds/{guild_id:\\d+}/builds", _handle_builds_list)
     app.router.add_post("/guilds/{guild_id:\\d+}/builds", _handle_builds_create)
@@ -1712,6 +1824,7 @@ def build_app(bot, token: str) -> web.Application:
     app.router.add_get("/guilds/{guild_id:\\d+}/discord/actions", _handle_discord_actions_list)
     app.router.add_post("/guilds/{guild_id:\\d+}/discord/actions", _handle_discord_actions_post)
     app.router.add_get("/bridge/whoami", _handle_bridge_whoami)
+    app.router.add_post("/bridge/report", _handle_bridge_report)
     return app
 
 

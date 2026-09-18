@@ -35,6 +35,8 @@ class AxiToolsBot(commands.Bot):
         self._global_sync_done = False
         self._synced_guilds: Set[int] = set()
         self._api_runner = None
+        self.bridge_queue = None
+        self.emoji_registry: dict = {}
 
     # ------------------------------------------------------------------
     async def setup_hook(self) -> None:
@@ -62,6 +64,29 @@ class AxiToolsBot(commands.Bot):
             self._api_runner = await start_api(self)
         except OSError as exc:
             LOGGER.warning("AxiTools API failed to start: %s", exc)
+
+        from .api.bridge_worker import BridgeSendQueue
+        from .scripts.sync_emoji import build_registry
+
+        self.bridge_queue = BridgeSendQueue(self)
+        self.bridge_queue.start()
+        try:
+            self.emoji_registry = build_registry(
+                [{"name": e.name, "id": e.id} for e in await self.fetch_application_emojis()]
+            )
+        except Exception:
+            LOGGER.exception("could not load application emoji; tokens will degrade to names")
+            self.emoji_registry = {}
+
+    async def send_bridge_report(self, channel, payload: dict, files=None) -> None:
+        """Send a relayed AxiBridge report as this bot."""
+        embeds = [discord.Embed.from_dict(e) for e in payload.get("embeds") or []]
+        await channel.send(
+            content=payload.get("content") or None,
+            embeds=embeds or None,
+            files=files or None,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def close(self) -> None:
         if self._api_runner is not None:
