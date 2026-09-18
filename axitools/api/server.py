@@ -332,13 +332,12 @@ async def _handle_bridge_whoami(request: web.Request) -> web.Response:
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 # Named after Discord's own attachment ceiling (10 files, 8 MiB each for a
-# non-boosted server), NOT a ceiling this server actually delivers today:
-# build_app() does not raise aiohttp's client_max_size (default 1 MiB), so in
-# practice any body over ~1 MiB gets aiohttp's generic 413 before this check
-# ever runs. AxiBridge's only current bridge payload class is JSON embeds
-# (well under 1 MiB); this constant and the per-file check below only matter
-# once image mode (which posts multipart with PNG attachments) gets a caller
-# again -- raise client_max_size in the same change that revives it.
+# non-boosted server). The map slice is the caller that revived image mode, so
+# build_app() now raises aiohttp's client_max_size to
+# MAX_BRIDGE_ATTACHMENT_BYTES + 1 MiB -- without that, any body over aiohttp's
+# 1 MiB default took a generic 413 before these checks ever ran. The count
+# limit is therefore no longer independently reachable; the body cap binds
+# first. See the comment in build_app().
 MAX_BRIDGE_ATTACHMENTS = 10
 MAX_BRIDGE_ATTACHMENT_BYTES = 8 * 1024 * 1024
 
@@ -1876,7 +1875,17 @@ async def _handle_members_linked(request: web.Request) -> web.Response:
 
 
 def build_app(bot, token: str) -> web.Application:
-    app = web.Application(middlewares=[_auth_middleware])
+    # aiohttp's default client_max_size is 1 MiB, which a bridged report
+    # carrying a map-slice PNG can exceed -- it would take aiohttp's generic
+    # 413 before _parse_bridge_report_body ever ran its own limits. Raise it
+    # to the per-attachment ceiling plus slack for the payload_json part, so
+    # the explicit checks below are the ones that actually decide. Note this
+    # also means MAX_BRIDGE_ATTACHMENTS x MAX_BRIDGE_ATTACHMENT_BYTES is no
+    # longer independently reachable: the body cap binds first.
+    app = web.Application(
+        middlewares=[_auth_middleware],
+        client_max_size=MAX_BRIDGE_ATTACHMENT_BYTES + 1024 * 1024,
+    )
     app["bot"] = bot
     app["api_token"] = token
     app["allow_global_token"] = global_token_enabled()
