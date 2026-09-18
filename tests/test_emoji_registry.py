@@ -150,20 +150,28 @@ def test_real_failure_mode_tokens_fit_before_substitution_overflow_after():
 
 
 def test_title_description_only_embed_without_fields_is_budgeted():
-    """CRITICAL 1: embeds without fields must have their title/description counted and truncated."""
-    # An embed with only a large title should be truncated.
+    """CRITICAL 1: embeds without fields must have their title/description counted and enforced."""
+    # An embed with only a large title should be either removed or truncated.
+    # Since _truncate_rows works on newline-separated content, a single line
+    # that exceeds the limit is dropped entirely (not split).
     large_title = "x" * 7000
     payload = {"embeds": [{"title": large_title}]}
     result = enforce_limits(payload)
-    assert len(result["embeds"][0]["title"]) <= EMBED_CHAR_LIMIT
+    embed = result["embeds"][0]
+    # Title should either be absent or <= EMBED_CHAR_LIMIT.
+    if "title" in embed:
+        assert len(embed["title"]) <= EMBED_CHAR_LIMIT
 
 
 def test_large_description_without_fields_is_truncated():
-    """CRITICAL 1: description in field-less embed must be truncated."""
+    """CRITICAL 1: description in field-less embed must be enforced against the budget."""
     large_desc = "y" * 7000
     payload = {"embeds": [{"description": large_desc}]}
     result = enforce_limits(payload)
-    assert len(result["embeds"][0]["description"]) <= EMBED_CHAR_LIMIT
+    embed = result["embeds"][0]
+    # Description should either be absent or <= EMBED_CHAR_LIMIT.
+    if "description" in embed:
+        assert len(embed["description"]) <= EMBED_CHAR_LIMIT
 
 
 def test_footer_text_counted_in_embed_budget():
@@ -237,3 +245,51 @@ def test_25_field_cap_with_small_fields_under_char_budget():
     # Verify char budget is NOT the limiting factor here.
     total_chars = sum(len(f["name"]) + len(f["value"]) for f in result["embeds"][0]["fields"])
     assert total_chars < EMBED_CHAR_LIMIT
+
+
+# --- Round-2 fixes: CRITICAL 1 and 2 regressions ---
+
+
+def test_title_and_description_combined_must_fit_within_embed_limit():
+    """CRITICAL 1 (round 2): title + description combined must fit within EMBED_CHAR_LIMIT.
+
+    This tests the exact case the reviewer identified: no fields, no footer,
+    title = "a"*4000 + description = "b"*4000. Neither exceeds 6000 individually,
+    but together they are 8000. The fix must ensure the combined total stays <= 6000.
+    """
+    payload = {
+        "embeds": [
+            {
+                "title": "a" * 4000,
+                "description": "b" * 4000,
+            }
+        ]
+    }
+    result = enforce_limits(payload)
+    embed = result["embeds"][0]
+    total = len(embed.get("title") or "") + len(embed.get("description") or "")
+    assert total <= EMBED_CHAR_LIMIT
+
+
+def test_large_footer_without_title_description_fields_is_truncated():
+    """CRITICAL 2 (round 2): footer.text must be truncated and the embed rewritten.
+
+    This tests the exact case the reviewer identified: no fields, no title,
+    no description, footer.text = "x"*7000. The footer exceeds EMBED_CHAR_LIMIT
+    and must be either dropped or its text truncated.
+    """
+    payload = {
+        "embeds": [
+            {
+                "footer": {"text": "x" * 7000},
+            }
+        ]
+    }
+    result = enforce_limits(payload)
+    embed = result["embeds"][0]
+    # Footer must either be absent or have its text length <= EMBED_CHAR_LIMIT.
+    if "footer" in embed and embed["footer"].get("text"):
+        assert len(embed["footer"]["text"]) <= EMBED_CHAR_LIMIT
+    # If footer is present, assert its text is definitely truncated.
+    if "footer" in embed:
+        assert len(embed["footer"].get("text", "")) <= EMBED_CHAR_LIMIT

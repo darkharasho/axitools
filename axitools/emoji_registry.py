@@ -108,23 +108,33 @@ def enforce_limits(payload: dict) -> dict:
     embeds = []
     for embed in (out.get("embeds") or [])[:MAX_EMBEDS]:
         new_embed = dict(embed)
-        # Truncate title and description, and budget all text in the embed.
-        title = new_embed.get("title") or ""
-        description = new_embed.get("description") or ""
-        title = _truncate_rows(title, EMBED_CHAR_LIMIT)
-        description = _truncate_rows(description, EMBED_CHAR_LIMIT)
-        new_embed["title"] = title
-        new_embed["description"] = description
+        remaining = EMBED_CHAR_LIMIT
 
-        # Account for footer text in budget.
-        footer_text = ""
-        if isinstance(new_embed.get("footer"), dict) and "text" in new_embed["footer"]:
-            footer_text = new_embed["footer"].get("text", "")
+        # Process title and description with running budget.
+        for key in ("title", "description"):
+            text = new_embed.get(key)
+            if text:
+                if len(text) > remaining:
+                    text = _truncate_rows(text, remaining)
+                if text:
+                    new_embed[key] = text
+                    remaining -= len(text)
+                else:
+                    new_embed.pop(key, None)
 
-        # Start budget accounting with title, description, and footer.
-        used = len(title) + len(description) + len(footer_text)
+        # Process footer with running budget.
+        footer = new_embed.get("footer")
+        if footer and footer.get("text"):
+            text = footer["text"]
+            if len(text) > remaining:
+                text = _truncate_rows(text, remaining)
+            if text:
+                new_embed["footer"] = {**footer, "text": text}
+                remaining -= len(text)
+            else:
+                new_embed.pop("footer", None)
 
-        # Process fields within the budget.
+        # Process fields within remaining budget.
         if new_embed.get("fields"):
             kept = []
             for field in new_embed["fields"][:FIELDS_PER_EMBED]:
@@ -132,9 +142,9 @@ def enforce_limits(payload: dict) -> dict:
                 if not value:
                     continue
                 cost = len(field.get("name", "")) + len(value)
-                if used + cost > EMBED_CHAR_LIMIT:
+                if cost > remaining:
                     break
-                used += cost
+                remaining -= cost
                 kept.append({**field, "value": value})
             new_embed["fields"] = kept
         embeds.append(new_embed)
