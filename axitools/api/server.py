@@ -41,6 +41,7 @@ DEFAULT_PORT = 8642
 DEFAULT_PUBLIC_URL = "http://127.0.0.1:8642"
 
 APP_KEY_PREFIX = "axt1."
+BRIDGE_KEY_PREFIX = "axb1."
 
 API_ACTOR_ID = 0
 
@@ -96,6 +97,15 @@ def generate_app_key(base_url: str | None = None) -> str:
     return f"{APP_KEY_PREFIX}{encoded_url}.{secret}"
 
 
+def generate_bridge_key(base_url: str | None = None) -> str:
+    """Build a channel-scoped AxiBridge key: ``axb1.<base64url(base_url)>.<secret>``."""
+    if base_url is None:
+        base_url = resolve_public_url()
+    encoded_url = base64.urlsafe_b64encode(base_url.encode("utf-8")).rstrip(b"=").decode("ascii")
+    secret = secrets.token_urlsafe(32)
+    return f"{BRIDGE_KEY_PREFIX}{encoded_url}.{secret}"
+
+
 def hash_app_key(key: str) -> str:
     """Return the sha256 hex digest of the full key string (what we persist)."""
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -103,8 +113,26 @@ def hash_app_key(key: str) -> str:
 
 @web.middleware
 async def _auth_middleware(request: web.Request, handler):
-    expected = f"Bearer {request.app['api_token']}"
     supplied = request.headers.get("Authorization", "")
+    bearer = supplied[len("Bearer "):] if supplied.startswith("Bearer ") else ""
+
+    # Bridge routes are reachable only with an axb1 key, and an axb1 key is
+    # reachable only on bridge routes. This mutual exclusion is the security
+    # boundary that keeps a desktop app's plaintext credential harmless.
+    is_bridge_path = request.path.startswith("/bridge")
+    if is_bridge_path or bearer.startswith(BRIDGE_KEY_PREFIX):
+        if not (is_bridge_path and bearer.startswith(BRIDGE_KEY_PREFIX)):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        bot = request.app["bot"]
+        token_hash = hash_app_key(bearer)
+        scope = await asyncio.to_thread(bot.storage.get_bridge_key_scope, token_hash)
+        if scope is None:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        asyncio.create_task(asyncio.to_thread(bot.storage.touch_bridge_key, token_hash))
+        request["bridge_scope"] = scope
+        return await handler(request)
+
+    expected = f"Bearer {request.app['api_token']}"
     if request.app["allow_global_token"] and secrets.compare_digest(
         supplied.encode(), expected.encode()
     ):
@@ -113,7 +141,6 @@ async def _auth_middleware(request: web.Request, handler):
         # rejected as an unknown bearer below.
         return await handler(request)
 
-    bearer = supplied[len("Bearer "):] if supplied.startswith("Bearer ") else ""
     if not bearer.startswith(APP_KEY_PREFIX):
         return web.json_response({"error": "unauthorized"}, status=401)
 
@@ -220,6 +247,31 @@ async def _handle_guilds(request: web.Request) -> web.Response:
     if scoped_guild_id is not None:
         guilds = [g for g in guilds if g.id == scoped_guild_id]
     return web.json_response([{"id": _sid(g.id), "name": g.name} for g in guilds])
+
+
+async def _handle_bridge_whoami(request: web.Request) -> web.Response:
+    """Identify the guild and channel a bridge key is bound to, for paste-time
+    validation in AxiBridge."""
+    guild_id, channel_id = request["bridge_scope"]
+    bot = request.app["bot"]
+    guild = discord.utils.get(bot.guilds, id=guild_id)
+    if guild is None:
+        return web.json_response(
+            {"error": "the bot is no longer in that server"}, status=403
+        )
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        return web.json_response(
+            {"error": "the paired channel no longer exists"}, status=403
+        )
+    return web.json_response(
+        {
+            "guild_id": str(guild_id),
+            "guild_name": guild.name,
+            "channel_id": str(channel_id),
+            "channel_name": getattr(channel, "name", str(channel_id)),
+        }
+    )
 
 
 async def _parse_json_body(request: web.Request) -> dict | None:
@@ -1659,6 +1711,7 @@ def build_app(bot, token: str) -> web.Application:
     app.router.add_get("/guilds/{guild_id:\\d+}/discord/messages", _handle_discord_messages)
     app.router.add_get("/guilds/{guild_id:\\d+}/discord/actions", _handle_discord_actions_list)
     app.router.add_post("/guilds/{guild_id:\\d+}/discord/actions", _handle_discord_actions_post)
+    app.router.add_get("/bridge/whoami", _handle_bridge_whoami)
     return app
 
 
