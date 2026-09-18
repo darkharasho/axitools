@@ -17,10 +17,11 @@ ALLOWED_TOP_KEYS = frozenset({"content", "embeds"})
 # sync with the client, not with the spec prose: see
 # tests/test_bridge_payload.py's captured fixture.
 ALLOWED_EMBED_KEYS = frozenset(
-    {"title", "description", "color", "url", "footer", "fields", "timestamp"}
+    {"title", "description", "color", "url", "footer", "fields", "timestamp", "image"}
 )
 ALLOWED_FIELD_KEYS = frozenset({"name", "value", "inline"})
 ALLOWED_FOOTER_KEYS = frozenset({"text"})
+ALLOWED_IMAGE_KEYS = frozenset({"url"})
 
 MAX_EMBEDS = 10
 MAX_FIELDS = 25
@@ -47,6 +48,25 @@ def _validate_footer(raw: Any) -> Dict[str, Any]:
     if unknown:
         raise ValueError(f"footer key not allowed: {sorted(unknown)[0]}")
     return {"text": _require_str(raw.get("text", ""), "footer.text")}
+
+
+def _validate_image(raw: Any) -> Dict[str, Any]:
+    """Embed images must reference a file uploaded in the same request.
+
+    Only the ``attachment://`` scheme is accepted. Allowing arbitrary URLs
+    would let any paired client make the bot render remote images, so the
+    value is bound to a part the request already carries -- which the existing
+    attachment count and byte limits already bound.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("embed image must be an object")
+    unknown = set(raw) - ALLOWED_IMAGE_KEYS
+    if unknown:
+        raise ValueError(f"embed image key not allowed: {sorted(unknown)[0]}")
+    url = raw.get("url")
+    if not isinstance(url, str) or not url.startswith("attachment://"):
+        raise ValueError("embed image url must use the attachment:// scheme")
+    return {"url": url}
 
 
 def _validate_field(raw: Any) -> Dict[str, Any]:
@@ -83,6 +103,8 @@ def _validate_embed(raw: Any) -> Dict[str, Any]:
         embed["color"] = raw["color"]
     if "footer" in raw:
         embed["footer"] = _validate_footer(raw["footer"])
+    if "image" in raw:
+        embed["image"] = _validate_image(raw["image"])
     if "fields" in raw:
         if not isinstance(raw["fields"], list):
             raise ValueError("embed.fields must be a list")

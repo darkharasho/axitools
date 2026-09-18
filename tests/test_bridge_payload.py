@@ -75,6 +75,9 @@ def test_strips_username_and_avatar():
 @pytest.mark.parametrize(
     "payload,reason",
     [
+        # `image` is now an allowed key, but only with an `attachment://`
+        # url -- this row still rejects the remote-URL form, which is the
+        # property it was written to protect.
         ({"embeds": [{"image": {"url": "http://x"}}]}, "image"),
         ({"embeds": [{"author": {"name": "x"}}]}, "author"),
         ({"embeds": [{"fields": [{"name": "a", "value": "b", "url": "http://x"}]}]}, "url"),
@@ -115,3 +118,37 @@ def test_content_only_message_is_valid():
 def test_rejects_at_everyone_in_content():
     with pytest.raises(ValueError, match="mention"):
         validate_report({"content": "@everyone look"})
+
+
+def _image_report(image):
+    return {"embeds": [{"title": "t", "image": image}]}
+
+
+def test_attachment_image_is_allowed():
+    validate_report(_image_report({"url": "attachment://slice.png"}))
+
+
+def test_attachment_image_survives_validation():
+    # Validating without copying the key through would silently drop the
+    # slice: the relay would accept the report and post it with no image.
+    out = validate_report(_image_report({"url": "attachment://slice.png"}))
+    assert out["embeds"][0]["image"] == {"url": "attachment://slice.png"}
+
+
+def test_remote_image_url_is_rejected():
+    # An unrestricted image.url would let any paired client make the bot
+    # render an arbitrary remote image.
+    with pytest.raises(ValueError):
+        validate_report(_image_report({"url": "https://evil.example/x.png"}))
+
+
+def test_image_without_url_is_rejected():
+    with pytest.raises(ValueError):
+        validate_report(_image_report({}))
+
+
+def test_unknown_image_key_is_rejected():
+    with pytest.raises(ValueError):
+        validate_report(
+            _image_report({"url": "attachment://slice.png", "proxy_url": "https://x/y"})
+        )

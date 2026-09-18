@@ -211,6 +211,24 @@ async def test_report_accepts_multipart_with_png(api_client, bridge_key, bot):
 
 
 @pytest.mark.asyncio
+async def test_report_accepts_a_png_over_aiohttps_default_body_limit(
+    api_client, bridge_key, bot
+):
+    # aiohttp's default client_max_size is 1 MiB and its 413 fires before any
+    # handler code, so a map-slice PNG over that size would be rejected no
+    # matter what the explicit attachment limits say. build_app() raises the
+    # cap for exactly this reason; without that, this test 413s.
+    big_png = PNG_BYTES + b"\x00" * (2 * 1024 * 1024)
+    form = _build_form({"content": "hi"}, [("slice.png", big_png, "image/png")])
+    resp = await api_client.post(
+        "/bridge/report", headers=_bearer(bridge_key), data=form
+    )
+    assert resp.status == 202
+    await _drain(bot)
+    assert bot.sent_payloads[-1]["content"] == "hi"
+
+
+@pytest.mark.asyncio
 async def test_report_rejects_multipart_non_png(api_client, bridge_key):
     form = _build_form(
         {"content": "hi"}, [("payload.txt", b"not a png", "text/plain")]
