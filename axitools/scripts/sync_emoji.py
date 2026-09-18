@@ -32,13 +32,33 @@ import aiohttp
 from PIL import Image
 
 from ..constants import EMOJI_ICON_PATH
-from ..emoji_registry import emoji_key_for_asset
+from ..emoji_registry import build_registry, emoji_key_for_asset
+
+# Re-exported for backward compatibility: earlier versions of this script
+# defined build_registry locally. It now lives in emoji_registry.py so
+# bot.py's boot path can import it without pulling in PIL/aiohttp (this
+# module's other imports).
+__all__ = ["build_registry"]
 
 LOGGER = logging.getLogger(__name__)
 
 EMOJI_SIZE = 128          # what Discord serves emoji at anyway
 EMOJI_MAX_BYTES = 256_000  # Discord's cap is 256 KB
 API_BASE = "https://discord.com/api/v10"
+
+
+class SyncEmojiConfigError(RuntimeError):
+    """Raised for a missing/invalid configuration this script cannot run without."""
+
+
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise SyncEmojiConfigError(
+            f"{name} is not set. Copy .env.example to .env and fill it in, or "
+            f"export {name} before running this script."
+        )
+    return value
 
 
 def normalize_icon(path: Path) -> bytes:
@@ -91,11 +111,33 @@ def plan_sync(
     return to_upload, to_delete
 
 
-def build_registry(emojis: List[dict]) -> Dict[str, str]:
-    """Map registry key -> ``<:name:id>`` markup."""
-    return {
-        str(emoji["name"]): f"<:{emoji['name']}:{emoji['id']}>" for emoji in emojis
-    }
+def ensure_local_icons_present(
+    local: Dict[str, bytes], directory: Path = EMOJI_ICON_PATH
+) -> None:
+    """Refuse to proceed when *local* is empty.
+
+    ``Path.glob`` on a missing or empty directory yields nothing and raises
+    nothing, so an empty *local* would otherwise make ``plan_sync`` treat
+    every remote emoji as orphaned -- ``--apply`` would then delete all of
+    them. Discord has no undo for that and re-creating mints new ids.
+    """
+    if not local:
+        raise SyncEmojiConfigError(
+            f"no local icons found in {directory} -- refusing to sync. An "
+            "empty local set would make every remote emoji look orphaned and "
+            "would delete all of them with --apply. Check that the directory "
+            "exists and contains .png files."
+        )
+
+
+def check_delete_confirmed(to_delete: List[str], allow_delete: bool) -> bool:
+    """Whether it is safe to proceed with the delete step.
+
+    Any non-empty ``to_delete`` requires an explicit ``--allow-delete``: dry
+    run is the default, but an inattentive ``--apply`` should not be able to
+    delete emoji (Discord has no undo, and re-creating mints new ids).
+    """
+    return not to_delete or allow_delete
 
 
 async def fetch_remote(session: aiohttp.ClientSession, app_id: str) -> Dict[str, str]:
@@ -105,10 +147,11 @@ async def fetch_remote(session: aiohttp.ClientSession, app_id: str) -> Dict[str,
     return {str(e["name"]): str(e["id"]) for e in body.get("items", body)}
 
 
-async def main_async(apply: bool) -> int:
-    token = os.environ["DISCORD_TOKEN"]
-    app_id = os.environ["DISCORD_APPLICATION_ID"]
+async def main_async(apply: bool, allow_delete: bool = False) -> int:
+    token = _require_env("DISCORD_TOKEN")
+    app_id = _require_env("DISCORD_APPLICATION_ID")
     local = load_local_icons()
+    ensure_local_icons_present(local)
     headers = {"Authorization": f"Bot {token}"}
 
     async with aiohttp.ClientSession(headers=headers) as session:
@@ -120,6 +163,18 @@ async def main_async(apply: bool) -> int:
         if not apply:
             print("dry run — pass --apply to write")
             return 0
+
+        if not check_delete_confirmed(to_delete, allow_delete):
+            print(
+                f"refusing to delete {len(to_delete)} emoji without --allow-delete: "
+                f"{to_delete}"
+            )
+            print(
+                "this is a destructive, irreversible action (Discord has no "
+                "undo, and re-creating mints new ids) -- re-run with "
+                "--allow-delete to confirm"
+            )
+            return 1
 
         for key in to_delete:
             async with session.delete(
@@ -142,9 +197,21 @@ async def main_async(apply: bool) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="perform the writes")
+    parser.add_argument(
+        "--allow-delete",
+        action="store_true",
+        help=(
+            "required to actually delete any remote emoji absent locally; "
+            "Discord has no undo and re-creating mints new ids"
+        ),
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    return asyncio.run(main_async(args.apply))
+    try:
+        return asyncio.run(main_async(args.apply, args.allow_delete))
+    except SyncEmojiConfigError as exc:
+        print(f"error: {exc}")
+        return 1
 
 
 if __name__ == "__main__":

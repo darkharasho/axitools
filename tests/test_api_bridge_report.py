@@ -25,10 +25,23 @@ PNG_BYTES = (
 )
 
 
+class FakePermissions:
+    def __init__(self, send_messages: bool = True) -> None:
+        self.send_messages = send_messages
+
+
 class FakeChannel:
-    def __init__(self, channel_id: int, name: str) -> None:
+    def __init__(self, channel_id: int, name: str, *, can_send: bool = True) -> None:
         self.id = channel_id
         self.name = name
+        self._can_send = can_send
+
+    def permissions_for(self, member) -> FakePermissions:
+        return FakePermissions(self._can_send)
+
+
+class FakeMe:
+    id = 1
 
 
 class FakeGuild:
@@ -36,6 +49,7 @@ class FakeGuild:
         self.id = guild_id
         self.name = name
         self._channels = {999: FakeChannel(999, "wvw-reports")}
+        self.me = FakeMe()
 
     def get_channel(self, channel_id: int):
         return self._channels.get(channel_id)
@@ -156,6 +170,20 @@ async def test_report_403_when_channel_is_gone(api_client, bot, monkeypatch):
         "/bridge/report", headers=_bearer(key), json={"content": "hi"}
     )
     assert resp.status == 403
+
+
+@pytest.mark.asyncio
+async def test_report_403_when_bot_cannot_send_in_channel(api_client, bot, bridge_key):
+    """I2: View Channel but not Send Messages must be caught here, not
+    silently swallowed later inside the async send worker."""
+    bot.guilds[0]._channels[999]._can_send = False
+    resp = await api_client.post(
+        "/bridge/report", headers=_bearer(bridge_key), json={"content": "hi"}
+    )
+    assert resp.status == 403
+    assert "send messages" in (await resp.json())["error"]
+    await _drain(bot)
+    assert bot.sent_payloads == []
 
 
 @pytest.mark.asyncio
@@ -359,3 +387,40 @@ async def test_report_400_on_invalid_json_inside_payload_json(api_client, bridge
     )
     assert resp.status == 400
     assert "invalid JSON in payload_json" in (await resp.json())["error"]
+
+
+# ---------------------------------------------------------------------------
+# I1: the central invariant is enforce_limits(substitute_payload(payload,
+# registry)). tests/test_emoji_registry.py:127 proves the two functions work
+# correctly IN THAT ORDER when composed directly -- it does not prove the
+# handler actually composes them that way. This test goes through the real
+# HTTP handler so a reversal at server.py's call site turns it red.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_report_field_fitting_before_substitution_overflows_after_stays_row_aligned(
+    api_client, bridge_key, bot
+):
+    bot.emoji_registry = {"firebrand": "<:firebrand:111111111111111111>"}
+    row = "{{spec:firebrand}} Player00"
+    value = "\n".join(row for _ in range(36))
+    assert len(value) < 1024  # fits comfortably BEFORE substitution
+
+    resp = await api_client.post(
+        "/bridge/report",
+        headers=_bearer(bridge_key),
+        json={"embeds": [{"fields": [{"name": "Damage", "value": value}]}]},
+    )
+    assert resp.status == 202
+    await _drain(bot)
+
+    delivered = bot.sent_payloads[-1]["embeds"][0]["fields"][0]["value"]
+    assert len(delivered) <= 1024
+    # Row-aligned: substitution's token growth must never leave a half
+    # `<:name:id>` reference -- each surviving row is a complete substituted
+    # row, not a partial one.
+    lines = delivered.split("\n")
+    assert lines  # something survived truncation
+    for line in lines:
+        assert line == "<:firebrand:111111111111111111> Player00"

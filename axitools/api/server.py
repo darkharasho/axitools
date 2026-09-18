@@ -116,6 +116,20 @@ def hash_app_key(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
+def _spawn_background(app: web.Application, coro) -> "asyncio.Task":
+    """Fire-and-forget a coroutine while keeping a reference to its task.
+
+    A bare ``asyncio.create_task(...)`` with no retained reference is only
+    weakly held by the event loop and can be garbage-collected mid-flight.
+    ``app["_background_tasks"]`` keeps it alive until it finishes.
+    """
+    task = asyncio.create_task(coro)
+    tasks: set = app["_background_tasks"]
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
+
+
 @web.middleware
 async def _auth_middleware(request: web.Request, handler):
     supplied = request.headers.get("Authorization", "")
@@ -124,7 +138,9 @@ async def _auth_middleware(request: web.Request, handler):
     # Bridge routes are reachable only with an axb1 key, and an axb1 key is
     # reachable only on bridge routes. This mutual exclusion is the security
     # boundary that keeps a desktop app's plaintext credential harmless.
-    is_bridge_path = request.path.startswith("/bridge")
+    # An exact-or-child-segment match, not a bare prefix: a future unrelated
+    # route like /bridgekeys must not silently inherit bridge-only auth.
+    is_bridge_path = request.path == "/bridge" or request.path.startswith("/bridge/")
     if is_bridge_path or bearer.startswith(BRIDGE_KEY_PREFIX):
         if not (is_bridge_path and bearer.startswith(BRIDGE_KEY_PREFIX)):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -133,7 +149,9 @@ async def _auth_middleware(request: web.Request, handler):
         scope = await asyncio.to_thread(bot.storage.get_bridge_key_scope, token_hash)
         if scope is None:
             return web.json_response({"error": "unauthorized"}, status=401)
-        asyncio.create_task(asyncio.to_thread(bot.storage.touch_bridge_key, token_hash))
+        _spawn_background(
+            request.app, asyncio.to_thread(bot.storage.touch_bridge_key, token_hash)
+        )
         request["bridge_scope"] = scope
         return await handler(request)
 
@@ -254,6 +272,26 @@ async def _handle_guilds(request: web.Request) -> web.Response:
     return web.json_response([{"id": _sid(g.id), "name": g.name} for g in guilds])
 
 
+def _bot_can_send(channel, guild) -> bool:
+    """Whether the bot can post in *channel*, defensively.
+
+    A missing ``guild.me`` or ``channel.permissions_for`` (a lightweight test
+    double, or an unusual channel type discord.py cannot compute permissions
+    for) is treated as "unknown, don't block" -- this check exists to turn
+    the common, static "Axi can see but not post in this channel" case (I2)
+    into an early, specific error, not to become a new way to reject an
+    otherwise-working channel.
+    """
+    me = getattr(guild, "me", None)
+    permissions_for = getattr(channel, "permissions_for", None)
+    if me is None or permissions_for is None:
+        return True
+    try:
+        return bool(permissions_for(me).send_messages)
+    except Exception:
+        return True
+
+
 async def _handle_bridge_whoami(request: web.Request) -> web.Response:
     """Identify the guild and channel a bridge key is bound to, for paste-time
     validation in AxiBridge."""
@@ -264,10 +302,20 @@ async def _handle_bridge_whoami(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "the bot is no longer in that server"}, status=403
         )
-    channel = guild.get_channel(channel_id)
-    if channel is None:
+    # Same resolver the report path uses (I4): whoami used to be a plain
+    # guild.get_channel, which never returns a thread, so a pairing made
+    # inside a thread would validate at pair time and then report itself
+    # "deleted" the moment the user pasted the key.
+    try:
+        channel = await resolve_channel(guild, channel_id)
+    except ValueError:
         return web.json_response(
             {"error": "the paired channel no longer exists"}, status=403
+        )
+    if not _bot_can_send(channel, guild):
+        return web.json_response(
+            {"error": "the bot cannot send messages in the paired channel"},
+            status=403,
         )
     return web.json_response(
         {
@@ -280,10 +328,14 @@ async def _handle_bridge_whoami(request: web.Request) -> web.Response:
 
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-# Explicit guard rather than relying on aiohttp's client_max_size default
-# (1 MiB): that's a framework-wide setting a future, unrelated change could
-# raise or lower, and Discord's own attachment ceiling (10 files, 8 MiB each
-# for a non-boosted server) is the limit that actually matters here.
+# Named after Discord's own attachment ceiling (10 files, 8 MiB each for a
+# non-boosted server), NOT a ceiling this server actually delivers today:
+# build_app() does not raise aiohttp's client_max_size (default 1 MiB), so in
+# practice any body over ~1 MiB gets aiohttp's generic 413 before this check
+# ever runs. AxiBridge's only current bridge payload class is JSON embeds
+# (well under 1 MiB); this constant and the per-file check below only matter
+# once image mode (which posts multipart with PNG attachments) gets a caller
+# again -- raise client_max_size in the same change that revives it.
 MAX_BRIDGE_ATTACHMENTS = 10
 MAX_BRIDGE_ATTACHMENT_BYTES = 8 * 1024 * 1024
 
@@ -373,10 +425,19 @@ async def _handle_bridge_report(request: web.Request) -> web.Response:
             {"error": "the bot is no longer in that server"}, status=403
         )
     try:
-        channel = resolve_channel(guild, channel_id)
+        channel = await resolve_channel(guild, channel_id)
     except ValueError:
         return web.json_response(
             {"error": "the paired channel no longer exists"}, status=403
+        )
+    if not _bot_can_send(channel, guild):
+        # I2: without this, a channel where Axi has View Channel but not Send
+        # Messages (a locked announcements channel is the common case) links
+        # cleanly, whoami reports healthy, and every report thereafter 202s
+        # and is dropped silently inside the async send worker.
+        return web.json_response(
+            {"error": "the bot cannot send messages in the paired channel"},
+            status=403,
         )
 
     # No inline-send fallback: a report must go through the queue so the
@@ -399,6 +460,14 @@ async def _handle_bridge_report(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=400)
 
     registry = getattr(bot, "emoji_registry", {}) or {}
+    if not registry:
+        # Rate-limited lazy recovery from a boot-time registry-load failure
+        # (I3): without this, an empty registry stays empty until a restart
+        # and every report silently posts plain text instead of icons.
+        maybe_refresh = getattr(bot, "maybe_refresh_emoji_registry", None)
+        if maybe_refresh is not None:
+            await maybe_refresh()
+            registry = getattr(bot, "emoji_registry", {}) or {}
     payload = enforce_limits(substitute_payload(payload, registry))
 
     try:
@@ -906,7 +975,7 @@ async def _handle_discord_messages(request: web.Request) -> web.Response:
     if window_err is not None:
         return web.json_response({"error": window_err}, status=400)
     try:
-        channel = discord_actions.resolve_channel(guild, int(target_id))
+        channel = await discord_actions.resolve_channel(guild, int(target_id))
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=404)
     # Forum and category channels hold threads / other channels, not messages, so
@@ -1809,6 +1878,7 @@ def build_app(bot, token: str) -> web.Application:
     app["api_token"] = token
     app["allow_global_token"] = global_token_enabled()
     app["bridge_rate_limiter"] = RateLimiter()
+    app["_background_tasks"] = set()
     app.router.add_get("/guilds", _handle_guilds)
     app.router.add_get("/guilds/{guild_id:\\d+}/builds", _handle_builds_list)
     app.router.add_post("/guilds/{guild_id:\\d+}/builds", _handle_builds_create)

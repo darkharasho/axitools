@@ -12,7 +12,7 @@ enforced here, after substitution, not by the client beforehand.
 from __future__ import annotations
 
 import re
-from typing import Dict
+from typing import Dict, List
 
 TOKEN_RE = re.compile(r"\{\{spec:([a-z0-9]+)\}\}")
 
@@ -38,6 +38,18 @@ def emoji_key_for_asset(filename: str) -> str:
     if stem.endswith("_icon"):
         stem = stem[: -len("_icon")]
     return stem.lower()
+
+
+def build_registry(emojis: List[dict]) -> Dict[str, str]:
+    """Map registry key -> ``<:name:id>`` markup.
+
+    Lives here (not in ``scripts/sync_emoji``) because ``bot.py`` needs it on
+    the boot path -- importing it from the sync script would drag PIL and
+    aiohttp into every startup for a 3-line pure function.
+    """
+    return {
+        str(emoji["name"]): f"<:{emoji['name']}:{emoji['id']}>" for emoji in emojis
+    }
 
 
 def substitute(text: str, registry: Dict[str, str]) -> str:

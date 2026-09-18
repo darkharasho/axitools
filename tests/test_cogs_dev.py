@@ -54,6 +54,7 @@ def test_dev_command_surface():
         "dev updatenotes",
         "dev rsstest",
         "dev bridgetest",
+        "dev emojireload",
     }
 
 
@@ -118,4 +119,21 @@ async def test_dev_bridgetest_submits_through_queue_when_running():
     interaction.response.send_message.assert_awaited_once()
     args, kwargs = interaction.response.send_message.call_args
     assert "Queued with 1 emoji" in args[0]
+    assert kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_dev_emojireload_refreshes_and_reports_count():
+    bot = MagicMock()
+    bot.refresh_emoji_registry = AsyncMock(return_value=7)
+    cog = DevCog(bot)
+    interaction = MagicMock()
+    interaction.response.send_message = AsyncMock()
+
+    await cog.emojireload.callback(cog, interaction)
+
+    bot.refresh_emoji_registry.assert_awaited_once()
+    interaction.response.send_message.assert_awaited_once()
+    args, kwargs = interaction.response.send_message.call_args
+    assert "7 emoji" in args[0]
     assert kwargs.get("ephemeral") is True

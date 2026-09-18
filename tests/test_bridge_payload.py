@@ -2,6 +2,29 @@ import pytest
 
 from axitools.api.bridge_payload import validate_report
 
+# Captured from the client's real renderer, not hand-written: this is the
+# exact key shape `DiscordNotifier` produces for a bridge-destination complex
+# embed (axibridge/src/main/discord.ts, `baseEmbed` ~:1107-1116 plus the
+# `embedFields`/`buildEmbeds` builders around it). The hand-written fixture
+# this replaced omitted `url` and `timestamp` -- exactly the two keys the
+# client actually sends on every embed -- which is how eleven task reviews
+# passed over a total outage (relay whitelist review, C1). If the client's
+# embed shape changes, RE-CAPTURE this fixture from `DiscordNotifier` (or from
+# `baseEmbed`/the field builders directly); do not hand-edit it to make a test
+# pass -- that is the exact defect this fixture exists to prevent.
+REAL_CLIENT_EMBED = {
+    "title": "[EU] Stonemist Keep",
+    "url": "https://dps.report/AbCd-20260917-120300_wvw",
+    "description": "**Duration:** 5m 12s\n**Outcome:** Victory",
+    "color": 0xFFFFFF,
+    "timestamp": "2026-09-17T12:03:00.000Z",
+    "footer": {"text": "AxiBridge • 8:03:00 AM"},
+    "fields": [
+        {"name": "Squad Summary:", "value": "```\nCount:     35\nDMG:   1,200,000\n```", "inline": True},
+        {"name": "Damage", "value": "{{spec:firebrand}} Alice 1.2M", "inline": True},
+    ],
+}
+
 VALID = {
     "content": "**Stonemist Keep** — 12:03",
     "embeds": [
@@ -22,6 +45,24 @@ def test_accepts_a_real_report():
     out = validate_report(VALID)
     assert out["embeds"][0]["fields"][0]["name"] == "Damage"
     assert out["content"] == VALID["content"]
+
+
+def test_accepts_the_captured_client_embed():
+    """Pins the relay whitelist to the client's actual output, not to prose.
+
+    This is the test that would have caught C1: it fails immediately if
+    `url` (or any other key the real client sends) is dropped from
+    ALLOWED_EMBED_KEYS.
+    """
+    out = validate_report({"embeds": [REAL_CLIENT_EMBED]})
+    embed = out["embeds"][0]
+    assert embed["title"] == REAL_CLIENT_EMBED["title"]
+    assert embed["url"] == REAL_CLIENT_EMBED["url"]
+    assert embed["description"] == REAL_CLIENT_EMBED["description"]
+    assert embed["color"] == REAL_CLIENT_EMBED["color"]
+    assert embed["timestamp"] == REAL_CLIENT_EMBED["timestamp"]
+    assert embed["footer"] == REAL_CLIENT_EMBED["footer"]
+    assert len(embed["fields"]) == len(REAL_CLIENT_EMBED["fields"])
 
 
 def test_strips_username_and_avatar():

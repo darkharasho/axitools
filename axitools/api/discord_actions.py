@@ -113,17 +113,32 @@ def validate_params(action: str, spec_params: dict, params: dict) -> dict:
 # Guild-scoped resource resolution
 # ---------------------------------------------------------------------------
 
-def resolve_channel(guild, channel_id: int):
-    """Return the channel (or thread) iff it belongs to *guild*."""
+async def resolve_channel(guild, channel_id: int):
+    """Return the channel (or thread) iff it belongs to *guild*.
+
+    Cache-first (``get_channel_or_thread`` / ``get_channel``). On a cache
+    miss, falls back to an API fetch so an uncached-but-live channel -- an
+    archived thread is the real case, since Discord's gateway cache drops
+    those -- still resolves instead of being reported as permanently deleted.
+    The fetch's failure modes are swallowed to a plain miss: no exception
+    text from it may reach a caller for use verbatim in a response body.
+    """
     getter = getattr(guild, "get_channel_or_thread", None) or guild.get_channel
     channel = getter(channel_id)
+    if channel is None:
+        fetch = getattr(guild, "fetch_channel", None)
+        if fetch is not None:
+            try:
+                channel = await fetch(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
     if channel is None or getattr(channel, "guild", guild).id != guild.id:
         raise ValueError(f"channel {channel_id} not found in this server")
     return channel
 
 
-def _resolve_category(guild, category_id: int):
-    category = resolve_channel(guild, category_id)
+async def _resolve_category(guild, category_id: int):
+    category = await resolve_channel(guild, category_id)
     if str(getattr(category, "type", "")) != "category":
         raise ValueError(f"channel {category_id} is not a category in this server")
     return category
@@ -185,7 +200,7 @@ async def _exec_channel_create(bot, guild, p: dict) -> dict:
             f"invalid channel type {ctype!r}: expected one of {', '.join(_CHANNEL_TYPES)}"
         )
     reason = audit_reason(None, "channel_create")
-    category = _resolve_category(guild, p["category_id"]) if "category_id" in p else None
+    category = await _resolve_category(guild, p["category_id"]) if "category_id" in p else None
     if ctype == "category":
         channel = await guild.create_category(p["name"], reason=reason)
     elif ctype == "voice":
@@ -202,14 +217,14 @@ async def _exec_channel_create(bot, guild, p: dict) -> dict:
 
 
 async def _exec_channel_update(bot, guild, p: dict) -> dict:
-    channel = resolve_channel(guild, p["channel_id"])
+    channel = await resolve_channel(guild, p["channel_id"])
     kwargs: dict = {}
     if "name" in p:
         kwargs["name"] = p["name"]
     if "topic" in p:
         kwargs["topic"] = p["topic"]
     if "category_id" in p:
-        kwargs["category"] = _resolve_category(guild, p["category_id"])
+        kwargs["category"] = await _resolve_category(guild, p["category_id"])
     if "slowmode_seconds" in p:
         kwargs["slowmode_delay"] = p["slowmode_seconds"]
     if "nsfw" in p:
@@ -221,7 +236,7 @@ async def _exec_channel_update(bot, guild, p: dict) -> dict:
 
 
 async def _exec_channel_delete(bot, guild, p: dict) -> dict:
-    channel = resolve_channel(guild, p["channel_id"])
+    channel = await resolve_channel(guild, p["channel_id"])
     await channel.delete(reason=audit_reason(p.get("reason"), "channel_delete"))
     return {"id": _sid(channel.id), "name": channel.name, "deleted": True}
 
@@ -369,20 +384,20 @@ async def _exec_members_dm(bot, guild, p: dict) -> dict:
 
 
 async def _exec_message_send(bot, guild, p: dict) -> dict:
-    channel = resolve_channel(guild, p["channel_id"])
+    channel = await resolve_channel(guild, p["channel_id"])
     message = await channel.send(p["content"])
     return {"id": _sid(message.id), "channel_id": _sid(channel.id)}
 
 
 async def _exec_message_pin(bot, guild, p: dict) -> dict:
-    channel = resolve_channel(guild, p["channel_id"])
+    channel = await resolve_channel(guild, p["channel_id"])
     message = await _resolve_message(channel, p["message_id"])
     await message.pin(reason=audit_reason(None, "message_pin"))
     return {"id": _sid(message.id), "channel_id": _sid(channel.id), "pinned": True}
 
 
 async def _exec_thread_create(bot, guild, p: dict) -> dict:
-    channel = resolve_channel(guild, p["channel_id"])
+    channel = await resolve_channel(guild, p["channel_id"])
     kwargs: dict = {"name": p["name"], "reason": audit_reason(None, "thread_create")}
     if "message_id" in p:
         kwargs["message"] = await _resolve_message(channel, p["message_id"])
@@ -404,7 +419,7 @@ async def _exec_event_create(bot, guild, p: dict) -> dict:
     if "description" in p:
         kwargs["description"] = p["description"]
     if "channel_id" in p:
-        channel = resolve_channel(guild, p["channel_id"])
+        channel = await resolve_channel(guild, p["channel_id"])
         if str(getattr(channel, "type", "")) not in ("voice", "stage_voice"):
             raise ValueError(
                 f"channel {p['channel_id']} is not a voice or stage channel"
@@ -440,7 +455,7 @@ def _resolve_forum_tags(parent, items: list):
 
 
 async def _exec_thread_update(bot, guild, p: dict) -> dict:
-    thread = resolve_channel(guild, p["thread_id"])
+    thread = await resolve_channel(guild, p["thread_id"])
     if "thread" not in str(getattr(thread, "type", "")):
         raise ValueError(f"channel {p['thread_id']} is not a thread / forum post")
     kwargs: dict = {}
@@ -476,21 +491,21 @@ async def _exec_thread_update(bot, guild, p: dict) -> dict:
 # -- messages & reactions ----------------------------------------------------
 
 async def _exec_message_unpin(bot, guild, p: dict) -> dict:
-    channel = resolve_channel(guild, p["channel_id"])
+    channel = await resolve_channel(guild, p["channel_id"])
     message = await _resolve_message(channel, p["message_id"])
     await message.unpin(reason=audit_reason(None, "message_unpin"))
     return {"id": _sid(message.id), "channel_id": _sid(channel.id), "pinned": False}
 
 
 async def _exec_message_delete(bot, guild, p: dict) -> dict:
-    channel = resolve_channel(guild, p["channel_id"])
+    channel = await resolve_channel(guild, p["channel_id"])
     message = await _resolve_message(channel, p["message_id"])
     await message.delete()
     return {"id": _sid(message.id), "channel_id": _sid(channel.id), "deleted": True}
 
 
 async def _exec_message_edit(bot, guild, p: dict) -> dict:
-    channel = resolve_channel(guild, p["channel_id"])
+    channel = await resolve_channel(guild, p["channel_id"])
     message = await _resolve_message(channel, p["message_id"])
     try:
         await message.edit(content=p["content"])
@@ -509,14 +524,14 @@ def _reaction_emoji(guild, emoji: str):
 
 
 async def _exec_reaction_add(bot, guild, p: dict) -> dict:
-    channel = resolve_channel(guild, p["channel_id"])
+    channel = await resolve_channel(guild, p["channel_id"])
     message = await _resolve_message(channel, p["message_id"])
     await message.add_reaction(_reaction_emoji(guild, p["emoji"]))
     return {"id": _sid(message.id), "channel_id": _sid(channel.id), "emoji": p["emoji"]}
 
 
 async def _exec_reaction_remove(bot, guild, p: dict) -> dict:
-    channel = resolve_channel(guild, p["channel_id"])
+    channel = await resolve_channel(guild, p["channel_id"])
     message = await _resolve_message(channel, p["message_id"])
     await message.remove_reaction(_reaction_emoji(guild, p["emoji"]), guild.me)
     return {"id": _sid(message.id), "channel_id": _sid(channel.id), "emoji": p["emoji"]}
@@ -524,8 +539,8 @@ async def _exec_reaction_remove(bot, guild, p: dict) -> dict:
 
 # -- forum tag management ----------------------------------------------------
 
-def _resolve_forum(guild, channel_id: int):
-    channel = resolve_channel(guild, channel_id)
+async def _resolve_forum(guild, channel_id: int):
+    channel = await resolve_channel(guild, channel_id)
     if str(getattr(channel, "type", "")) != "forum":
         raise ValueError(f"channel {channel_id} is not a forum channel")
     return channel
@@ -551,7 +566,7 @@ def _forum_tag_emoji(guild, emoji: str):
 
 
 async def _exec_forum_tag_create(bot, guild, p: dict) -> dict:
-    forum = _resolve_forum(guild, p["channel_id"])
+    forum = await _resolve_forum(guild, p["channel_id"])
     kwargs: dict = {"name": p["name"], "reason": audit_reason(None, "forum_tag_create")}
     if "emoji" in p:
         kwargs["emoji"] = _forum_tag_emoji(guild, p["emoji"])
@@ -562,7 +577,7 @@ async def _exec_forum_tag_create(bot, guild, p: dict) -> dict:
 
 
 async def _exec_forum_tag_edit(bot, guild, p: dict) -> dict:
-    forum = _resolve_forum(guild, p["channel_id"])
+    forum = await _resolve_forum(guild, p["channel_id"])
     tag = _resolve_forum_tag(forum, p["tag"])
     kwargs: dict = {}
     if "name" in p:
@@ -578,7 +593,7 @@ async def _exec_forum_tag_edit(bot, guild, p: dict) -> dict:
 
 
 async def _exec_forum_tag_delete(bot, guild, p: dict) -> dict:
-    forum = _resolve_forum(guild, p["channel_id"])
+    forum = await _resolve_forum(guild, p["channel_id"])
     tag = _resolve_forum_tag(forum, p["tag"])
     await tag.delete()
     return {"id": _sid(tag.id), "name": tag.name, "deleted": True}

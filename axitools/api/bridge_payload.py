@@ -9,8 +9,15 @@ from __future__ import annotations
 from typing import Any, Dict
 
 ALLOWED_TOP_KEYS = frozenset({"content", "embeds"})
+# Every key the client's baseEmbed/embedFields builders can emit
+# (axibridge/src/main/discord.ts, ~:1107-1116 and the field builders). ``url``
+# is on every complex embed the client has ever sent (it linkifies the title
+# to the dps.report permalink) -- a bare URL cannot inject content, so it is
+# no more dangerous than the fields already allowed here. Keep this set in
+# sync with the client, not with the spec prose: see
+# tests/test_bridge_payload.py's captured fixture.
 ALLOWED_EMBED_KEYS = frozenset(
-    {"title", "description", "color", "footer", "fields", "timestamp"}
+    {"title", "description", "color", "url", "footer", "fields", "timestamp"}
 )
 ALLOWED_FIELD_KEYS = frozenset({"name", "value", "inline"})
 ALLOWED_FOOTER_KEYS = frozenset({"text"})
@@ -67,7 +74,7 @@ def _validate_embed(raw: Any) -> Dict[str, Any]:
         raise ValueError(f"embed key not allowed: {sorted(unknown)[0]}")
 
     embed: Dict[str, Any] = {}
-    for key in ("title", "description", "timestamp"):
+    for key in ("title", "description", "timestamp", "url"):
         if key in raw:
             embed[key] = _require_str(raw[key], f"embed.{key}")
     if "color" in raw:

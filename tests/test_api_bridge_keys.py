@@ -1,13 +1,13 @@
 import base64
 from pathlib import Path
 
+import discord
 import pytest
 import pytest_asyncio
 
 from axitools.api.server import (
     APP_KEY_PREFIX,
     BRIDGE_KEY_PREFIX,
-    DEFAULT_PUBLIC_URL,
     build_app,
     generate_app_key,
     generate_bridge_key,
@@ -16,10 +16,23 @@ from axitools.api.server import (
 from axitools.storage import StorageManager
 
 
+class FakePermissions:
+    def __init__(self, send_messages: bool = True) -> None:
+        self.send_messages = send_messages
+
+
 class FakeChannel:
-    def __init__(self, channel_id: int, name: str) -> None:
+    def __init__(self, channel_id: int, name: str, *, can_send: bool = True) -> None:
         self.id = channel_id
         self.name = name
+        self._can_send = can_send
+
+    def permissions_for(self, member) -> FakePermissions:
+        return FakePermissions(self._can_send)
+
+
+class FakeMe:
+    id = 1
 
 
 class FakeGuild:
@@ -27,9 +40,24 @@ class FakeGuild:
         self.id = guild_id
         self.name = name
         self._channels = {999: FakeChannel(999, "wvw-reports")}
+        # Channels visible only via an API fetch, never the cache -- models
+        # an archived thread, which Discord's gateway cache drops.
+        self._fetchable = {}
+        self.me = FakeMe()
 
     def get_channel(self, channel_id: int):
         return self._channels.get(channel_id)
+
+    async def fetch_channel(self, channel_id: int):
+        channel = self._fetchable.get(channel_id)
+        if channel is None:
+            raise discord.NotFound(_FakeResponse(), "not found")
+        return channel
+
+
+class _FakeResponse:
+    status = 404
+    reason = "Not Found"
 
 
 class FakeBot:
@@ -158,3 +186,47 @@ async def test_bridge_key_rejected_on_guild_routes(api_client, bridge_key):
 async def test_bridge_key_rejected_on_guilds_index(api_client, bridge_key):
     resp = await api_client.get("/guilds", headers=_bearer(bridge_key))
     assert resp.status == 401
+
+
+# ---------------------------------------------------------------------------
+# I4: whoami and report must resolve the paired channel the same way, and an
+# uncached-but-live channel (the real case is an archived thread, which
+# Discord's gateway cache drops) must resolve via fetch rather than being
+# reported as permanently deleted.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_whoami_resolves_via_fetch_when_not_cached(api_client, bot):
+    """The archived-thread case: get_channel misses, fetch_channel succeeds."""
+    guild = bot.guilds[0]
+    thread = FakeChannel(7777, "archived-wvw-thread")
+    guild._fetchable[7777] = thread
+
+    key = generate_bridge_key()
+    bot.storage.add_bridge_key(123, 7777, hash_app_key(key), created_by=42)
+
+    resp = await api_client.get("/bridge/whoami", headers=_bearer(key))
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["channel_name"] == "archived-wvw-thread"
+
+
+@pytest.mark.asyncio
+async def test_whoami_403_when_neither_cache_nor_fetch_finds_channel(api_client, bot):
+    key = generate_bridge_key()
+    bot.storage.add_bridge_key(123, 999999, hash_app_key(key), created_by=42)
+
+    resp = await api_client.get("/bridge/whoami", headers=_bearer(key))
+    assert resp.status == 403
+    body = await resp.json()
+    assert body["error"] == "the paired channel no longer exists"
+
+
+@pytest.mark.asyncio
+async def test_whoami_403_when_bot_cannot_send_in_channel(api_client, bot, bridge_key):
+    bot.guilds[0]._channels[999]._can_send = False
+    resp = await api_client.get("/bridge/whoami", headers=_bearer(bridge_key))
+    assert resp.status == 403
+    body = await resp.json()
+    assert "send messages" in body["error"]

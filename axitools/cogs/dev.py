@@ -90,6 +90,21 @@ class DevCog(commands.GroupCog, name="dev", group_extras={"category": "Dev"}):
             f"Queued with {len(registry)} emoji in the registry.", ephemeral=True
         )
 
+    @app_commands.command(
+        name="emojireload",
+        description="Re-fetch application emoji from Discord and rebuild the bridge registry.",
+    )
+    async def emojireload(self, interaction: discord.Interaction) -> None:
+        # I3: setup_hook only loads the registry once, and a transient
+        # Discord failure at boot leaves it empty (every bridged report then
+        # posts plain text) until something re-fetches. This is the explicit,
+        # unrate-limited trigger for that; the HTTP path also does a rate
+        # limited version of the same fetch when the registry is empty.
+        count = await self.bot.refresh_emoji_registry()
+        await interaction.response.send_message(
+            f"Reloaded emoji registry: {count} emoji.", ephemeral=True
+        )
+
 
 async def setup(bot: AxiToolsBot) -> None:
     if not PRODUCTION:

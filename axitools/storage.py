@@ -1035,7 +1035,7 @@ class ApiKeyStore:
             created_at=created_at,
         )
 
-    def get_bridge_key_scope(self, token_hash: str) -> Optional[tuple]:
+    def get_bridge_key_scope(self, token_hash: str) -> tuple[int, int] | None:
         """Return ``(guild_id, channel_id)`` bound to ``token_hash``, if any."""
 
         with self._connect() as connection:
@@ -2498,7 +2498,7 @@ class StorageManager:
     ) -> BridgeKeyInfo:
         return self.api_key_store.add_bridge_key(guild_id, channel_id, token_hash, created_by)
 
-    def get_bridge_key_scope(self, token_hash: str) -> Optional[tuple]:
+    def get_bridge_key_scope(self, token_hash: str) -> tuple[int, int] | None:
         return self.api_key_store.get_bridge_key_scope(token_hash)
 
     def touch_bridge_key(self, token_hash: str) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Set
 
 import discord
@@ -15,6 +16,11 @@ from .api.server import start_api
 from .storage import DEFAULT_STORAGE_ROOT, GuildConfig, StorageManager
 
 LOGGER = logging.getLogger(__name__)
+
+# Minimum interval between lazy registry re-fetch attempts, so a persistent
+# Discord-side failure cannot make every bridged report hammer
+# fetch_application_emojis(). See AxiToolsBot.maybe_refresh_emoji_registry.
+EMOJI_REGISTRY_REFRESH_COOLDOWN_SECONDS = 300
 
 
 class AxiToolsBot(commands.Bot):
@@ -37,6 +43,7 @@ class AxiToolsBot(commands.Bot):
         self._api_runner = None
         self.bridge_queue = None
         self.emoji_registry: dict = {}
+        self._emoji_registry_last_attempt: float | None = None
 
     # ------------------------------------------------------------------
     async def setup_hook(self) -> None:
@@ -66,22 +73,60 @@ class AxiToolsBot(commands.Bot):
         # is still None, and the handler would have nowhere safe to hand the
         # send off to.
         from .api.bridge_worker import BridgeSendQueue
-        from .scripts.sync_emoji import build_registry
 
         self.bridge_queue = BridgeSendQueue(self)
         self.bridge_queue.start()
-        try:
-            self.emoji_registry = build_registry(
-                [{"name": e.name, "id": e.id} for e in await self.fetch_application_emojis()]
-            )
-        except Exception:
-            LOGGER.exception("could not load application emoji; tokens will degrade to names")
-            self.emoji_registry = {}
+        await self.refresh_emoji_registry()
 
         try:
             self._api_runner = await start_api(self)
         except OSError as exc:
             LOGGER.warning("AxiTools API failed to start: %s", exc)
+
+    async def refresh_emoji_registry(self) -> int:
+        """Re-fetch application emoji from Discord and rebuild the registry.
+
+        Called from ``setup_hook``, from ``/dev emojireload``, and (rate
+        limited) from ``maybe_refresh_emoji_registry``. A failure here is
+        non-fatal by design -- tokens degrade to plain spec names -- but it
+        must never raise, since two of its three callers are on paths that
+        must not 500/crash.
+        """
+        from .emoji_registry import build_registry
+
+        self._emoji_registry_last_attempt = time.monotonic()
+        try:
+            self.emoji_registry = build_registry(
+                [
+                    {"name": e.name, "id": e.id}
+                    for e in await self.fetch_application_emojis()
+                ]
+            )
+        except Exception:
+            LOGGER.exception(
+                "could not load application emoji; tokens will degrade to names"
+            )
+            self.emoji_registry = {}
+        return len(self.emoji_registry)
+
+    async def maybe_refresh_emoji_registry(self) -> None:
+        """Lazily re-fetch the registry when it is empty, rate limited.
+
+        A transient Discord 5xx (or rate limit) during ``setup_hook`` leaves
+        ``emoji_registry`` empty with no in-process way to recover until a
+        restart -- every subsequent report would silently post plain text
+        forever. This gives it one retry per bridged report, but never more
+        than once per ``EMOJI_REGISTRY_REFRESH_COOLDOWN_SECONDS``, so a
+        persistent outage cannot turn "one report every few seconds" into
+        "one fetch_application_emojis() call every few seconds".
+        """
+        if self.emoji_registry:
+            return
+        now = time.monotonic()
+        last = self._emoji_registry_last_attempt
+        if last is not None and now - last < EMOJI_REGISTRY_REFRESH_COOLDOWN_SECONDS:
+            return
+        await self.refresh_emoji_registry()
 
     async def send_bridge_report(self, channel, payload: dict, files=None) -> None:
         """Send a relayed AxiBridge report as this bot."""
