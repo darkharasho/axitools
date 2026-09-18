@@ -130,7 +130,14 @@ async def resolve_channel(guild, channel_id: int):
         if fetch is not None:
             try:
                 channel = await fetch(channel_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException,
+                discord.InvalidData,
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ):
                 channel = None
     if channel is None or getattr(channel, "guild", guild).id != guild.id:
         raise ValueError(f"channel {channel_id} not found in this server")

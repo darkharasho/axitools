@@ -8,6 +8,7 @@ import pytest_asyncio
 from axitools.api.server import (
     APP_KEY_PREFIX,
     BRIDGE_KEY_PREFIX,
+    _bot_can_send,
     build_app,
     generate_app_key,
     generate_bridge_key,
@@ -17,8 +18,11 @@ from axitools.storage import StorageManager
 
 
 class FakePermissions:
-    def __init__(self, send_messages: bool = True) -> None:
+    def __init__(
+        self, send_messages: bool = True, send_messages_in_threads: bool = True
+    ) -> None:
         self.send_messages = send_messages
+        self.send_messages_in_threads = send_messages_in_threads
 
 
 class FakeChannel:
@@ -230,3 +234,75 @@ async def test_whoami_403_when_bot_cannot_send_in_channel(api_client, bot, bridg
     assert resp.status == 403
     body = await resp.json()
     assert "send messages" in body["error"]
+
+
+# ---------------------------------------------------------------------------
+# N1: threads have their own permission bit (send_messages_in_threads), not
+# the parent channel's send_messages -- a locked-announcements-plus-threads
+# layout (parent denies send_messages, thread allows send_messages_in_threads)
+# must pass; a regular channel denying send_messages must still be rejected.
+# No Discord network call: the "thread" is a bare discord.Thread instance
+# built with object.__new__ so isinstance() succeeds, with permissions_for
+# stubbed on the instance -- discord.py's own permission resolution is never
+# exercised.
+# ---------------------------------------------------------------------------
+
+
+class _FakeThread(discord.Thread):
+    """A real discord.Thread subclass so isinstance() checks succeed, with
+    permissions_for stubbed rather than exercising discord.py's own
+    permission resolution (which needs a real parent channel/overwrites)."""
+
+    def __init__(self, permissions: FakePermissions) -> None:
+        # Deliberately skip discord.Thread.__init__ (it expects real gateway
+        # payload dicts); this is a bare permission-resolution stub, not a
+        # functioning thread object.
+        self._permissions = permissions
+
+    def permissions_for(self, member) -> FakePermissions:  # type: ignore[override]
+        return self._permissions
+
+
+def _fake_thread(permissions: FakePermissions) -> discord.Thread:
+    return _FakeThread(permissions)
+
+
+def test_bot_can_send_true_for_thread_when_parent_denies_send_messages():
+    thread = _fake_thread(
+        FakePermissions(send_messages=False, send_messages_in_threads=True)
+    )
+    assert _bot_can_send(thread, FakeGuild(1, "g")) is True
+
+
+def test_bot_can_send_false_for_thread_when_threads_denied():
+    thread = _fake_thread(
+        FakePermissions(send_messages=True, send_messages_in_threads=False)
+    )
+    assert _bot_can_send(thread, FakeGuild(1, "g")) is False
+
+
+def test_bot_can_send_false_for_regular_channel_when_send_messages_denied():
+    channel = FakeChannel(999, "wvw-reports", can_send=False)
+    assert _bot_can_send(channel, FakeGuild(1, "g")) is False
+
+
+@pytest.mark.asyncio
+async def test_whoami_200_for_thread_with_locked_parent(api_client, bot):
+    """The exact regression scenario: a read-only announcements channel with
+    discussion threads. The bot cannot post in the parent but can post in the
+    thread, so whoami must not 403."""
+    guild = bot.guilds[0]
+    thread = _fake_thread(
+        FakePermissions(send_messages=False, send_messages_in_threads=True)
+    )
+    thread.id = 7777
+    thread.name = "locked-parent-thread"
+    guild._fetchable[7777] = thread
+
+    key = generate_bridge_key()
+    bot.storage.add_bridge_key(123, 7777, hash_app_key(key), created_by=42)
+
+    resp = await api_client.get("/bridge/whoami", headers=_bearer(key))
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["channel_name"] == "locked-parent-thread"

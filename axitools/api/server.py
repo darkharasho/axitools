@@ -287,7 +287,10 @@ def _bot_can_send(channel, guild) -> bool:
     if me is None or permissions_for is None:
         return True
     try:
-        return bool(permissions_for(me).send_messages)
+        perms = permissions_for(me)
+        if isinstance(channel, discord.Thread):
+            return bool(perms.send_messages_in_threads)
+        return bool(perms.send_messages)
     except Exception:
         return True
 

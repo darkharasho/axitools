@@ -112,12 +112,29 @@ def test_require_env_raises_clear_message_not_keyerror(monkeypatch):
 @pytest.mark.asyncio
 async def test_main_async_refuses_when_local_directory_is_empty(monkeypatch):
     """The exact I6 failure scenario: an empty/missing local dir must never
-    reach the delete loop, even under --apply."""
+    reach the delete loop, even under --apply.
+
+    N4: the session is mocked here too, the same way its two siblings below
+    mock it, even though the guard under test should raise before any session
+    is ever built. If that guard regresses, this test must fail loudly rather
+    than fall through to a real (unmocked) aiohttp.ClientSession and make an
+    unauthenticated call to Discord's API -- exactly the shape of a prior
+    guard breach. A raising fake session (instead of a "no calls" recorder)
+    is what turns a silent guard regression into a hard test failure instead
+    of quietly asserting nothing.
+    """
     import axitools.scripts.sync_emoji as sync_emoji
 
     monkeypatch.setenv("DISCORD_TOKEN", "t")
     monkeypatch.setenv("DISCORD_APPLICATION_ID", "1")
     monkeypatch.setattr(sync_emoji, "load_local_icons", lambda: {})
+
+    def _network_forbidden(**kwargs):
+        raise AssertionError(
+            "no ClientSession should be constructed when local icons are empty"
+        )
+
+    monkeypatch.setattr(sync_emoji.aiohttp, "ClientSession", _network_forbidden)
 
     with pytest.raises(SyncEmojiConfigError, match="no local icons found"):
         await sync_emoji.main_async(apply=True)
