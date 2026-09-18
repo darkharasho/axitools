@@ -46,6 +46,7 @@ class AxiToolsBot(commands.Bot):
         await self.load_extension("axitools.cogs.account_self")
         await self.load_extension("axitools.cogs.guild_roles")
         await self.load_extension("axitools.cogs.select")
+        await self.load_extension("axitools.cogs.bridge")
         await self.load_extension("axitools.cogs.builds")
         await self.load_extension("axitools.cogs.arcdps")
         await self.load_extension("axitools.cogs.update_notes")
