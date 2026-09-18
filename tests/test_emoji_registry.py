@@ -293,3 +293,27 @@ def test_large_footer_without_title_description_fields_is_truncated():
     # If footer is present, assert its text is definitely truncated.
     if "footer" in embed:
         assert len(embed["footer"].get("text", "")) <= EMBED_CHAR_LIMIT
+
+
+def test_embed_char_limit_is_a_whole_message_budget_not_per_embed():
+    """Discord's 6000-char cap is the combined sum across every embed.
+
+    Budgeting it per-embed let a multi-embed report through at a multiple of
+    the real limit, which Discord answers with a 400 -- so the whole report
+    fails rather than losing its tail.
+    """
+    field = {"name": "Damage", "value": _rows(20)}
+    payload = {
+        "embeds": [
+            {"fields": [dict(field) for _ in range(25)]},
+            {"fields": [dict(field) for _ in range(25)]},
+        ]
+    }
+    embeds = enforce_limits(payload)["embeds"]
+    total = sum(
+        len(e.get("title", "")) + len(e.get("description", ""))
+        + len((e.get("footer") or {}).get("text", ""))
+        + sum(len(f["name"]) + len(f["value"]) for f in e.get("fields", []))
+        for e in embeds
+    )
+    assert total <= EMBED_CHAR_LIMIT

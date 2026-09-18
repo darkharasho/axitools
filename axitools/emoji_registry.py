@@ -123,9 +123,13 @@ def enforce_limits(payload: dict) -> dict:
         out["content"] = _truncate_rows(out["content"], CONTENT_LIMIT)
 
     embeds = []
+    # Discord's 6000-character cap is the combined sum across *every* embed
+    # attached to a message, not an allowance each embed gets to itself.
+    # Budgeting it per-embed let a two-embed report through at up to 12,000
+    # characters, which Discord answers with a 400.
+    remaining = EMBED_CHAR_LIMIT
     for embed in (out.get("embeds") or [])[:MAX_EMBEDS]:
         new_embed = dict(embed)
-        remaining = EMBED_CHAR_LIMIT
 
         # Process title and description with running budget.
         for key in ("title", "description"):
