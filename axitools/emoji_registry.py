@@ -103,16 +103,30 @@ def enforce_limits(payload: dict) -> dict:
     """Return a copy of *payload* trimmed to Discord's documented maxima."""
     out = dict(payload)
     if out.get("content"):
-        out["content"] = out["content"][:CONTENT_LIMIT]
+        out["content"] = _truncate_rows(out["content"], CONTENT_LIMIT)
 
     embeds = []
     for embed in (out.get("embeds") or [])[:MAX_EMBEDS]:
         new_embed = dict(embed)
+        # Truncate title and description, and budget all text in the embed.
+        title = new_embed.get("title") or ""
+        description = new_embed.get("description") or ""
+        title = _truncate_rows(title, EMBED_CHAR_LIMIT)
+        description = _truncate_rows(description, EMBED_CHAR_LIMIT)
+        new_embed["title"] = title
+        new_embed["description"] = description
+
+        # Account for footer text in budget.
+        footer_text = ""
+        if isinstance(new_embed.get("footer"), dict) and "text" in new_embed["footer"]:
+            footer_text = new_embed["footer"].get("text", "")
+
+        # Start budget accounting with title, description, and footer.
+        used = len(title) + len(description) + len(footer_text)
+
+        # Process fields within the budget.
         if new_embed.get("fields"):
             kept = []
-            used = len(new_embed.get("title") or "") + len(
-                new_embed.get("description") or ""
-            )
             for field in new_embed["fields"][:FIELDS_PER_EMBED]:
                 value = _truncate_rows(field.get("value", ""), FIELD_VALUE_LIMIT)
                 if not value:

@@ -119,3 +119,121 @@ def test_embed_char_limit_drops_trailing_fields():
 def test_too_many_embeds_are_dropped():
     payload = {"embeds": [{"description": "x"} for _ in range(14)]}
     assert len(enforce_limits(payload)["embeds"]) == 10
+
+
+# --- failure modes caught by the review ---
+
+
+def test_real_failure_mode_tokens_fit_before_substitution_overflow_after():
+    """The core failure mode: short tokens become long emoji markup."""
+    # Before substitution, this payload is well under limits.
+    payload = {
+        "embeds": [
+            {
+                "fields": [
+                    {"name": "Damage", "value": "\n".join(f"{{{{spec:firebrand}}}} Player{i:02d}" for i in range(50))}
+                ]
+            }
+        ]
+    }
+    # Substitution expands tokens.
+    after_sub = substitute_payload(payload, REGISTRY)
+    # enforce_limits must truncate the oversized field.
+    limited = enforce_limits(after_sub)
+    value = limited["embeds"][0]["fields"][0]["value"]
+    assert len(value) <= FIELD_VALUE_LIMIT
+    # Each row is ~39 chars, so ~26 rows fit in 1024 chars.
+    # Just verify it's truncated and doesn't have all 50.
+    num_rows = len(value.split("\n"))
+    assert num_rows < 50
+    assert num_rows >= 20  # Should keep a reasonable number
+
+
+def test_title_description_only_embed_without_fields_is_budgeted():
+    """CRITICAL 1: embeds without fields must have their title/description counted and truncated."""
+    # An embed with only a large title should be truncated.
+    large_title = "x" * 7000
+    payload = {"embeds": [{"title": large_title}]}
+    result = enforce_limits(payload)
+    assert len(result["embeds"][0]["title"]) <= EMBED_CHAR_LIMIT
+
+
+def test_large_description_without_fields_is_truncated():
+    """CRITICAL 1: description in field-less embed must be truncated."""
+    large_desc = "y" * 7000
+    payload = {"embeds": [{"description": large_desc}]}
+    result = enforce_limits(payload)
+    assert len(result["embeds"][0]["description"]) <= EMBED_CHAR_LIMIT
+
+
+def test_footer_text_counted_in_embed_budget():
+    """CRITICAL 2: footer.text must be included in the 6000-char budget."""
+    # A field that fits when footer is NOT counted, but overflows when it IS.
+    # Footer is 6000 chars, leaving 0 for the field.
+    footer_text = "x" * 6000
+    field_value = "y" * 100
+    payload = {
+        "embeds": [
+            {
+                "footer": {"text": footer_text},
+                "fields": [{"name": "Field", "value": field_value}]
+            }
+        ]
+    }
+    result = enforce_limits(payload)
+    # Field should be dropped because footer+field > 6000.
+    assert len(result["embeds"][0].get("fields", [])) == 0
+
+
+def test_footer_text_counted_with_title_and_description():
+    """CRITICAL 2: footer.text is part of the per-embed budget alongside title/description."""
+    # A scenario where title + description + footer + field must all fit in 6000.
+    title = "a" * 1000
+    description = "b" * 1000
+    footer = "c" * 1000
+    field_value = "d" * 3500
+    payload = {
+        "embeds": [
+            {
+                "title": title,
+                "description": description,
+                "footer": {"text": footer},
+                "fields": [{"name": "Field", "value": field_value}]
+            }
+        ]
+    }
+    result = enforce_limits(payload)
+    # All text must sum to <= 6000.
+    total = (
+        len(result["embeds"][0].get("title") or "") +
+        len(result["embeds"][0].get("description") or "") +
+        len(result["embeds"][0].get("footer", {}).get("text") or "") +
+        sum(len(f["name"]) + len(f["value"]) for f in result["embeds"][0].get("fields", []))
+    )
+    assert total <= EMBED_CHAR_LIMIT
+
+
+def test_content_with_emoji_is_not_split_mid_markup():
+    """IMPORTANT 3: content must use _truncate_rows to avoid splitting emoji markup."""
+    # Build content that has emoji markup repeated enough to exceed CONTENT_LIMIT.
+    emoji_row = REGISTRY["firebrand"] + " Player\n"
+    content = emoji_row * 100  # Will exceed 2000 chars.
+    payload = {"content": content}
+    result = enforce_limits(payload)
+    # Should be truncated but not mid-emoji.
+    truncated = result["content"]
+    assert len(truncated) <= 2000
+    assert "<:firebrand:111111111111111" not in truncated.replace(REGISTRY["firebrand"], "")
+
+
+def test_25_field_cap_with_small_fields_under_char_budget():
+    """IMPORTANT 5: 25-field cap must be enforced even when char budget is not exceeded."""
+    # Many small fields that individually fit but exceed 25 count.
+    fields = [{"name": f"F{i}", "value": f"v{i}"} for i in range(30)]
+    payload = {"embeds": [{"fields": fields}]}
+    result = enforce_limits(payload)
+    # Should keep at most 25 fields.
+    assert len(result["embeds"][0].get("fields", [])) <= 25
+    # Verify char budget is NOT the limiting factor here.
+    total_chars = sum(len(f["name"]) + len(f["value"]) for f in result["embeds"][0]["fields"])
+    assert total_chars < EMBED_CHAR_LIMIT
