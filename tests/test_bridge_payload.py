@@ -13,6 +13,10 @@ from axitools.api.bridge_payload import validate_report
 # `baseEmbed`/the field builders directly); do not hand-edit it to make a test
 # pass -- that is the exact defect this fixture exists to prevent.
 REAL_CLIENT_EMBED = {
+    "author": {
+        "name": "AxiBridge",
+        "icon_url": "https://raw.githubusercontent.com/darkharasho/axibridge/main/public/img/AxiBridge-glyph.png",
+    },
     "title": "[EU] Stonemist Keep",
     "url": "https://dps.report/AbCd-20260917-120300_wvw",
     "description": "**Duration:** 5m 12s\n**Outcome:** Victory",
@@ -62,6 +66,7 @@ def test_accepts_the_captured_client_embed():
     assert embed["color"] == REAL_CLIENT_EMBED["color"]
     assert embed["timestamp"] == REAL_CLIENT_EMBED["timestamp"]
     assert embed["footer"] == REAL_CLIENT_EMBED["footer"]
+    assert embed["author"] == REAL_CLIENT_EMBED["author"]
     assert len(embed["fields"]) == len(REAL_CLIENT_EMBED["fields"])
 
 
@@ -79,7 +84,11 @@ def test_strips_username_and_avatar():
         # url -- this row still rejects the remote-URL form, which is the
         # property it was written to protect.
         ({"embeds": [{"image": {"url": "http://x"}}]}, "image"),
-        ({"embeds": [{"author": {"name": "x"}}]}, "author"),
+        ({"embeds": [{"author": {"url": "http://x"}}]}, "author"),
+        (
+            {"embeds": [{"author": {"name": "x", "icon_url": "http://x/y.png"}}]},
+            "icon_url",
+        ),
         ({"embeds": [{"fields": [{"name": "a", "value": "b", "url": "http://x"}]}]}, "url"),
         ({"allowed_mentions": {"parse": ["everyone"]}, "embeds": []}, "allowed_mentions"),
         ({"mentions": ["123"], "embeds": []}, "mentions"),
@@ -152,3 +161,31 @@ def test_unknown_image_key_is_rejected():
         validate_report(
             _image_report({"url": "attachment://slice.png", "proxy_url": "https://x/y"})
         )
+
+
+def test_author_without_an_icon_is_allowed():
+    """The header does not require the glyph -- name alone is a valid author."""
+    out = validate_report({"embeds": [{"author": {"name": "AxiBridge"}}]})
+    assert out["embeds"][0]["author"] == {"name": "AxiBridge"}
+
+
+def test_author_icon_must_come_from_the_axibridge_repo():
+    """The bot fetches this URL, so a paired client cannot aim it anywhere."""
+    with pytest.raises(ValueError, match="icon_url"):
+        validate_report(
+            {
+                "embeds": [
+                    {
+                        "author": {
+                            "name": "AxiBridge",
+                            "icon_url": "https://evil.example/tracker.png",
+                        }
+                    }
+                ]
+            }
+        )
+
+
+def test_author_name_is_bounded():
+    with pytest.raises(ValueError, match="author.name"):
+        validate_report({"embeds": [{"author": {"name": "x" * 257}}]})

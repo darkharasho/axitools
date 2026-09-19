@@ -317,3 +317,30 @@ def test_embed_char_limit_is_a_whole_message_budget_not_per_embed():
         for e in embeds
     )
     assert total <= EMBED_CHAR_LIMIT
+
+
+def test_author_name_is_charged_against_the_shared_budget():
+    """The header repeats per embed, so it eats the same 6000 the body does."""
+    payload = {
+        "embeds": [
+            {"author": {"name": "AxiBridge"}, "description": "d" * 5995},
+            {"author": {"name": "AxiBridge"}, "description": "second"},
+        ]
+    }
+    out = enforce_limits(payload)
+    total = sum(
+        len(e.get("author", {}).get("name", "")) + len(e.get("description", ""))
+        for e in out["embeds"]
+    )
+    assert total <= 6000
+
+
+def test_author_is_dropped_when_no_budget_remains():
+    payload = {
+        "embeds": [
+            {"description": "d" * 6000},
+            {"author": {"name": "AxiBridge"}, "description": "second"},
+        ]
+    }
+    out = enforce_limits(payload)
+    assert "author" not in out["embeds"][1]
