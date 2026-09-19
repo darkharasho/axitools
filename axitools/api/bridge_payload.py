@@ -17,16 +17,33 @@ ALLOWED_TOP_KEYS = frozenset({"content", "embeds"})
 # sync with the client, not with the spec prose: see
 # tests/test_bridge_payload.py's captured fixture.
 ALLOWED_EMBED_KEYS = frozenset(
-    {"title", "description", "color", "url", "footer", "fields", "timestamp", "image"}
+    {
+        "title",
+        "description",
+        "color",
+        "url",
+        "footer",
+        "fields",
+        "timestamp",
+        "image",
+        "author",
+    }
 )
 ALLOWED_FIELD_KEYS = frozenset({"name", "value", "inline"})
 ALLOWED_FOOTER_KEYS = frozenset({"text"})
 ALLOWED_IMAGE_KEYS = frozenset({"url"})
+ALLOWED_AUTHOR_KEYS = frozenset({"name", "icon_url"})
+
+# The author icon is a remote URL, so it gets the same treatment as embed
+# images: pinned to content this project controls rather than left open. The
+# client's glyph lives in the axibridge repo, served raw from GitHub.
+AUTHOR_ICON_PREFIX = "https://raw.githubusercontent.com/darkharasho/axibridge/"
 
 MAX_EMBEDS = 10
 MAX_FIELDS = 25
 MAX_CONTENT = 2000
 MAX_TEXT = 6000  # per string; enforce_limits does the per-embed accounting
+MAX_AUTHOR_NAME = 256  # Discord's own cap on embed.author.name
 
 # Dropped silently rather than rejected: a bot cannot set them, and AxiBridge's
 # webhook path legitimately includes them.
@@ -69,6 +86,36 @@ def _validate_image(raw: Any) -> Dict[str, Any]:
     return {"url": url}
 
 
+def _validate_author(raw: Any) -> Dict[str, Any]:
+    """The embed header: who posted this.
+
+    ``name`` is free text the client fills with its own product name, so it
+    is bounded like any other string. ``icon_url`` is a remote fetch the bot
+    would perform on a paired client's say-so, so it is restricted to the
+    axibridge repo -- the same reasoning that limits ``image`` to
+    ``attachment://``, applied to the one remote host this key needs.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("embed author must be an object")
+    unknown = set(raw) - ALLOWED_AUTHOR_KEYS
+    if unknown:
+        raise ValueError(f"embed author key not allowed: {sorted(unknown)[0]}")
+
+    name = _require_str(raw.get("name", ""), "author.name")
+    if len(name) > MAX_AUTHOR_NAME:
+        raise ValueError("author.name is too long")
+    author: Dict[str, Any] = {"name": name}
+
+    if "icon_url" in raw:
+        icon_url = raw["icon_url"]
+        if not isinstance(icon_url, str) or not icon_url.startswith(AUTHOR_ICON_PREFIX):
+            raise ValueError(
+                f"author.icon_url must start with {AUTHOR_ICON_PREFIX}"
+            )
+        author["icon_url"] = icon_url
+    return author
+
+
 def _validate_field(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("each field must be an object")
@@ -105,6 +152,8 @@ def _validate_embed(raw: Any) -> Dict[str, Any]:
         embed["footer"] = _validate_footer(raw["footer"])
     if "image" in raw:
         embed["image"] = _validate_image(raw["image"])
+    if "author" in raw:
+        embed["author"] = _validate_author(raw["author"])
     if "fields" in raw:
         if not isinstance(raw["fields"], list):
             raise ValueError("embed.fields must be a list")

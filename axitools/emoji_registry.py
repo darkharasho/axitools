@@ -17,6 +17,7 @@ from typing import Dict, List
 TOKEN_RE = re.compile(r"\{\{spec:([a-z0-9]+)\}\}")
 
 FIELD_VALUE_LIMIT = 1024
+AUTHOR_NAME_LIMIT = 256
 EMBED_CHAR_LIMIT = 6000
 FIELDS_PER_EMBED = 25
 MAX_EMBEDS = 10
@@ -130,6 +131,20 @@ def enforce_limits(payload: dict) -> dict:
     remaining = EMBED_CHAR_LIMIT
     for embed in (out.get("embeds") or [])[:MAX_EMBEDS]:
         new_embed = dict(embed)
+
+        # The author header repeats on every embed a report splits into and
+        # counts against the same 6000, so it is charged before the body --
+        # the client bills it the same way when it decides where to split.
+        author = new_embed.get("author")
+        if author and author.get("name"):
+            name = author["name"][:AUTHOR_NAME_LIMIT]
+            if len(name) > remaining:
+                name = ""
+            if name:
+                new_embed["author"] = {**author, "name": name}
+                remaining -= len(name)
+            else:
+                new_embed.pop("author", None)
 
         # Process title and description with running budget.
         for key in ("title", "description"):
