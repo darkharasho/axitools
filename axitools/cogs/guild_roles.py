@@ -623,17 +623,120 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
         name="clear",
         description="Clear the alliance guild used for WvW membership checks in role audits.",
     )
-    async def clear_alliance_guild(self, interaction: discord.Interaction) -> None:
+    @app_commands.describe(
+        cleanup_roles="Remove the role mapped to the alliance guild from existing members"
+    )
+    async def clear_alliance_guild(
+        self, interaction: discord.Interaction, cleanup_roles: bool = False
+    ) -> None:
         if not await self.bot.ensure_authorised(interaction):
             return
         config = self.bot.get_config(interaction.guild.id)  # type: ignore[union-attr]
+        alliance_guild_id = (
+            self._normalise_guild_id(config.alliance_guild_id)
+            if config.alliance_guild_id
+            else None
+        )
+        alliance_role_id = (
+            config.guild_role_ids.get(alliance_guild_id) if alliance_guild_id else None
+        )
+        alliance_role = (
+            interaction.guild.get_role(alliance_role_id)
+            if alliance_role_id and interaction.guild
+            else None
+        )
+
+        cleanup_summary: Optional[str] = None
+        cleanup_rows: List[Sequence[str]] = []
+        if cleanup_roles and alliance_role:
+            cleanup_summary, cleanup_rows = await self._cleanup_alliance_role(
+                interaction, config, alliance_guild_id, alliance_role
+            )
+        elif cleanup_roles:
+            cleanup_summary = (
+                "No role is mapped to the alliance guild, so there was nothing to clean up."
+            )
+
         config.alliance_guild_id = None
         config.alliance_guild_name = None
         self.bot.save_config(interaction.guild.id, config)  # type: ignore[union-attr]
+
+        description_lines = ["WvW membership checks will use the audited guild roster."]
+        if cleanup_summary:
+            description_lines.append(cleanup_summary)
         await self._send_embed(
             interaction,
             title="Alliance guild cleared",
-            description="WvW membership checks will use the audited guild roster.",
+            description="\n".join(description_lines),
+        )
+
+        if cleanup_rows:
+            report_table = self._format_table(
+                ["Discord", "Display name", "GW2 account", "Roles removed"],
+                cleanup_rows,
+                placeholder="None",
+                code_block=False,
+            )
+            await interaction.followup.send(
+                content="**Alliance role cleanup**",
+                files=[
+                    discord.File(
+                        fp=StringIO(report_table), filename="alliance_cleanup.txt"
+                    )
+                ],
+                ephemeral=True,
+            )
+
+    async def _cleanup_alliance_role(
+        self,
+        interaction: discord.Interaction,
+        config: GuildConfig,
+        alliance_guild_id: Optional[str],
+        alliance_role: discord.Role,
+    ) -> Tuple[str, List[Sequence[str]]]:
+        """Strip the alliance guild's mapped role, leaving other guild roles alone."""
+
+        other_role_ids = {
+            role_id
+            for guild_id, role_id in config.guild_role_ids.items()
+            if guild_id != alliance_guild_id
+        }
+        account_names: Dict[int, str] = {}
+        for _guild_id, user_id, record in self.bot.storage.query_api_keys(
+            guild_id=interaction.guild.id  # type: ignore[union-attr]
+        ):
+            if record.account_name and user_id not in account_names:
+                account_names[user_id] = record.account_name
+
+        rows: List[Sequence[str]] = []
+        failure: Optional[str] = None
+        for member in list(alliance_role.members):
+            keeps_other_roles = any(role.id in other_role_ids for role in member.roles)
+            try:
+                await member.remove_roles(
+                    alliance_role, reason="GW2 alliance guild role cleanup"
+                )
+            except discord.Forbidden:
+                failure = "I do not have permission to remove the alliance role from all members."
+                break
+            except discord.HTTPException:
+                failure = "Failed to remove the alliance role from some members due to a Discord error."
+                break
+            rows.append(
+                (
+                    self._strip_emoji(member.name),
+                    self._strip_emoji(member.display_name),
+                    self._strip_emoji(account_names.get(member.id, "--")),
+                    self._strip_emoji(alliance_role.name)
+                    + ("" if keeps_other_roles else " (only guild role)"),
+                )
+            )
+
+        if failure:
+            return failure, rows
+        return (
+            f"Removed {alliance_role.mention} from {len(rows)} member(s); other guild roles were kept.",
+            rows,
         )
 
     @guild_role_allowlist.command(
