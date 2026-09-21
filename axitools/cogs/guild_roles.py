@@ -624,10 +624,14 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
         description="Clear the alliance guild used for WvW membership checks in role audits.",
     )
     @app_commands.describe(
-        cleanup_roles="Remove the role mapped to the alliance guild from existing members"
+        cleanup_roles="Remove the role mapped to the alliance guild from existing members",
+        plan="Preview what would happen without clearing the alliance guild or changing roles",
     )
     async def clear_alliance_guild(
-        self, interaction: discord.Interaction, cleanup_roles: bool = False
+        self,
+        interaction: discord.Interaction,
+        cleanup_roles: bool = False,
+        plan: bool = False,
     ) -> None:
         if not await self.bot.ensure_authorised(interaction):
             return
@@ -650,12 +654,42 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
         cleanup_rows: List[Sequence[str]] = []
         if cleanup_roles and alliance_role:
             cleanup_summary, cleanup_rows = await self._cleanup_alliance_role(
-                interaction, config, alliance_guild_id, alliance_role
+                interaction, config, alliance_guild_id, alliance_role, dry_run=plan
             )
         elif cleanup_roles:
             cleanup_summary = (
-                "No role is mapped to the alliance guild, so there was nothing to clean up."
+                "No role is mapped to the alliance guild, so there would be nothing to clean up."
+                if plan
+                else "No role is mapped to the alliance guild, so there was nothing to clean up."
             )
+
+        if plan:
+            alliance_label = (
+                config.alliance_guild_name
+                or config.alliance_guild_id
+                or "none configured"
+            )
+            description_lines = [
+                f"Alliance guild: **{alliance_label}**",
+                "Would clear the alliance guild so WvW membership checks use the audited guild roster.",
+            ]
+            if cleanup_summary:
+                description_lines.append(cleanup_summary)
+            elif alliance_role:
+                description_lines.append(
+                    f"{alliance_role.mention} would be left on "
+                    f"{len(alliance_role.members)} member(s); re-run with `cleanup_roles: True` to strip it."
+                )
+            description_lines.append("Nothing was changed.")
+            await self._send_embed(
+                interaction,
+                title="Alliance guild clear (plan)",
+                description="\n".join(description_lines),
+            )
+            await self._send_cleanup_report(
+                interaction, cleanup_rows, planned=True
+            )
+            return
 
         config.alliance_guild_id = None
         config.alliance_guild_name = None
@@ -670,22 +704,42 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
             description="\n".join(description_lines),
         )
 
-        if cleanup_rows:
-            report_table = self._format_table(
-                ["Discord", "Display name", "GW2 account", "Roles removed"],
-                cleanup_rows,
-                placeholder="None",
-                code_block=False,
-            )
-            await interaction.followup.send(
-                content="**Alliance role cleanup**",
-                files=[
-                    discord.File(
-                        fp=StringIO(report_table), filename="alliance_cleanup.txt"
-                    )
-                ],
-                ephemeral=True,
-            )
+        await self._send_cleanup_report(interaction, cleanup_rows)
+
+    async def _send_cleanup_report(
+        self,
+        interaction: discord.Interaction,
+        cleanup_rows: List[Sequence[str]],
+        *,
+        planned: bool = False,
+    ) -> None:
+        if not cleanup_rows:
+            return
+        report_table = self._format_table(
+            [
+                "Discord",
+                "Display name",
+                "GW2 account",
+                "Roles to remove" if planned else "Roles removed",
+            ],
+            cleanup_rows,
+            placeholder="None",
+            code_block=False,
+        )
+        await interaction.followup.send(
+            content="**Alliance role cleanup (plan)**"
+            if planned
+            else "**Alliance role cleanup**",
+            files=[
+                discord.File(
+                    fp=StringIO(report_table),
+                    filename="alliance_cleanup_plan.txt"
+                    if planned
+                    else "alliance_cleanup.txt",
+                )
+            ],
+            ephemeral=True,
+        )
 
     async def _cleanup_alliance_role(
         self,
@@ -693,6 +747,8 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
         config: GuildConfig,
         alliance_guild_id: Optional[str],
         alliance_role: discord.Role,
+        *,
+        dry_run: bool = False,
     ) -> Tuple[str, List[Sequence[str]]]:
         """Strip the alliance guild's mapped role, leaving other guild roles alone."""
 
@@ -712,16 +768,17 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
         failure: Optional[str] = None
         for member in list(alliance_role.members):
             keeps_other_roles = any(role.id in other_role_ids for role in member.roles)
-            try:
-                await member.remove_roles(
-                    alliance_role, reason="GW2 alliance guild role cleanup"
-                )
-            except discord.Forbidden:
-                failure = "I do not have permission to remove the alliance role from all members."
-                break
-            except discord.HTTPException:
-                failure = "Failed to remove the alliance role from some members due to a Discord error."
-                break
+            if not dry_run:
+                try:
+                    await member.remove_roles(
+                        alliance_role, reason="GW2 alliance guild role cleanup"
+                    )
+                except discord.Forbidden:
+                    failure = "I do not have permission to remove the alliance role from all members."
+                    break
+                except discord.HTTPException:
+                    failure = "Failed to remove the alliance role from some members due to a Discord error."
+                    break
             rows.append(
                 (
                     self._strip_emoji(member.name),
@@ -734,6 +791,15 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
 
         if failure:
             return failure, rows
+        if dry_run:
+            only_role = sum(1 for row in rows if str(row[3]).endswith("(only guild role)"))
+            summary = (
+                f"Would remove {alliance_role.mention} from {len(rows)} member(s); "
+                "other guild roles would be kept."
+            )
+            if only_role:
+                summary += f" {only_role} of them would be left with no guild role."
+            return summary, rows
         return (
             f"Removed {alliance_role.mention} from {len(rows)} member(s); other guild roles were kept.",
             rows,
@@ -842,9 +908,14 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
     @app_commands.describe(
         guild_id="Guild Wars 2 guild ID to remove",
         cleanup_roles="Remove the mapped role from existing members",
+        plan="Preview what would happen without removing the mapping or changing roles",
     )
     async def remove_guild_role(
-        self, interaction: discord.Interaction, guild_id: str, cleanup_roles: bool = False
+        self,
+        interaction: discord.Interaction,
+        guild_id: str,
+        cleanup_roles: bool = False,
+        plan: bool = False,
     ) -> None:
         if not await self.bot.ensure_authorised(interaction):
             return
@@ -852,10 +923,15 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
         config = self.bot.get_config(interaction.guild.id)  # type: ignore[union-attr]
         existing_ids = list(config.guild_role_ids.keys())
         normalized_id = self._normalise_guild_id(guild_id)
-        removed = config.guild_role_ids.pop(normalized_id, None)
-        if removed is None and normalized_id != guild_id:
-            removed = config.guild_role_ids.pop(guild_id, None)
-        self.bot.save_config(interaction.guild.id, config)  # type: ignore[union-attr]
+        mapped_key: Optional[str] = None
+        if normalized_id in config.guild_role_ids:
+            mapped_key = normalized_id
+        elif guild_id in config.guild_role_ids:
+            mapped_key = guild_id
+        removed = config.guild_role_ids.get(mapped_key) if mapped_key else None
+        if removed is not None and not plan:
+            config.guild_role_ids.pop(mapped_key, None)
+            self.bot.save_config(interaction.guild.id, config)  # type: ignore[union-attr]
 
         if not removed:
             embeds = await self._build_guild_role_embeds(
@@ -872,7 +948,11 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
 
         cleanup_summary = None
         role = interaction.guild.get_role(removed) if interaction.guild else None
-        if cleanup_roles and role:
+        if cleanup_roles and role and plan:
+            cleanup_summary = (
+                f"Would remove {role.mention} from {len(role.members)} member(s)."
+            )
+        elif cleanup_roles and role:
             removed_count = 0
             failure: Optional[str] = None
             for member in list(role.members):
@@ -891,7 +971,28 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
             else:
                 cleanup_summary = f"Removed {removed_count} instance(s) of {role.mention} from members."
         elif cleanup_roles:
-            cleanup_summary = "Cannot clean up roles because the mapped role no longer exists."
+            cleanup_summary = (
+                "The mapped role no longer exists, so there would be nothing to clean up."
+                if plan
+                else "Cannot clean up roles because the mapped role no longer exists."
+            )
+
+        if plan:
+            description_lines = [f"Would remove the mapping for guild `{guild_id}`."]
+            if cleanup_summary:
+                description_lines.append(cleanup_summary)
+            elif role:
+                description_lines.append(
+                    f"{role.mention} would be left on {len(role.members)} member(s); "
+                    "re-run with `cleanup_roles: True` to strip it."
+                )
+            description_lines.append("Nothing was changed.")
+            await self._send_embed(
+                interaction,
+                title="Guild role mapping removal (plan)",
+                description="\n".join(description_lines),
+            )
+            return
 
         description_lines = [f"Removed mapping for guild `{guild_id}`."]
         if cleanup_summary:
