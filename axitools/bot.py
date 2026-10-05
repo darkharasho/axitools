@@ -1,18 +1,21 @@
 """Bot setup for AxiTools."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
-from typing import Set
+from typing import Iterable, Set
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from .api.server import start_api
+from .remote_config import REFRESH_SECONDS, RemoteConfig, policy_for
 from .storage import DEFAULT_STORAGE_ROOT, GuildConfig, StorageManager
 
 LOGGER = logging.getLogger(__name__)
@@ -21,6 +24,25 @@ LOGGER = logging.getLogger(__name__)
 # Discord-side failure cannot make every bridged report hammer
 # fetch_application_emojis(). See AxiToolsBot.maybe_refresh_emoji_registry.
 EMOJI_REGISTRY_REFRESH_COOLDOWN_SECONDS = 300
+
+
+class AxiCommandTree(app_commands.CommandTree):
+    """Command tree that refuses users and servers on the Axi access denylist."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        policy = policy_for(self.client)
+        if policy is None:
+            return True
+        identities = [("discord_user", str(interaction.user.id))]
+        if interaction.guild_id is not None:
+            identities.append(("discord_server", str(interaction.guild_id)))
+        if not policy.any_blocked(identities):
+            return True
+        try:
+            await interaction.response.send_message("Unavailable.", ephemeral=True)
+        except discord.HTTPException:
+            LOGGER.debug("Could not answer a refused interaction", exc_info=True)
+        return False
 
 
 class AxiToolsBot(commands.Bot):
@@ -35,8 +57,11 @@ class AxiToolsBot(commands.Bot):
             command_prefix=commands.when_mentioned_or("gw2!"),
             intents=intents,
             application_id=None,
+            tree_cls=AxiCommandTree,
         )
         self.storage = StorageManager(storage_root)
+        self.remote_config = RemoteConfig.from_env()
+        self._policy_task: asyncio.Task | None = None
         self.tree.on_error = self.on_app_command_error
         self._global_sync_done = False
         self._synced_guilds: Set[int] = set()
@@ -66,6 +91,7 @@ class AxiToolsBot(commands.Bot):
         await self.load_extension("axitools.cogs.reset")
         await self.load_extension("axitools.cogs.streaming")
         await self.load_extension("axitools.cogs.dev")
+        await self.load_extension("axitools.cogs.access_admin")
 
         # The bridge queue (and emoji registry) must exist and be running
         # BEFORE the HTTP API starts accepting requests. Otherwise there is a
@@ -73,6 +99,11 @@ class AxiToolsBot(commands.Bot):
         # is still None, and the handler would have nowhere safe to hand the
         # send off to.
         from .api.bridge_worker import BridgeSendQueue
+
+        # Load the access denylist before the API accepts requests. refresh()
+        # never raises and times out after 10 s; on failure nothing is refused.
+        await self.remote_config.refresh()
+        self._policy_task = asyncio.create_task(self._policy_loop())
 
         self.bridge_queue = BridgeSendQueue(self)
         self.bridge_queue.start()
@@ -138,19 +169,53 @@ class AxiToolsBot(commands.Bot):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    async def leave_blocked_guilds(self, guilds: Iterable[discord.Guild] | None = None) -> int:
+        """Leave every server on the Axi access denylist. Returns how many were left."""
+        left = 0
+        for guild in list(self.guilds if guilds is None else guilds):
+            if not self.remote_config.is_blocked("discord_server", str(guild.id)):
+                continue
+            try:
+                await guild.leave()
+            except discord.HTTPException:
+                LOGGER.exception("Could not leave server %s (access revoked)", guild.id)
+                continue
+            LOGGER.info("Left server %s: access revoked", guild.id)
+            left += 1
+        return left
+
+    async def _policy_tick(self) -> None:
+        try:
+            await self.remote_config.refresh()
+            await self.leave_blocked_guilds()
+        except Exception:
+            LOGGER.exception("Access policy refresh failed")
+
+    async def _policy_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(REFRESH_SECONDS)
+            await self._policy_tick()
+
     async def close(self) -> None:
+        if self._policy_task is not None:
+            self._policy_task.cancel()
+            self._policy_task = None
         if self._api_runner is not None:
             await self._api_runner.cleanup()
             self._api_runner = None
         await super().close()
 
     async def on_ready(self) -> None:
+        await self.leave_blocked_guilds()
         await self._sync_global_commands()
         for guild in self.guilds:
             await self._sync_guild_commands(guild)
         LOGGER.info("AxiTools is ready. Logged in as %s (%s)", self.user, getattr(self.user, "id", "unknown"))
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
+        if await self.leave_blocked_guilds([guild]):
+            return
         await self._sync_global_commands()
         await self._sync_guild_commands(guild)
 
