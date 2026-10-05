@@ -14,6 +14,7 @@ from discord.ext import commands
 
 from ..bot import AxiToolsBot
 from ..branding import BRAND_COLOUR
+from ..remote_config import policy_for
 from ..storage import ApiKeyRecord, GuildConfig
 from ._accounts_shared import AccountsSharedMixin
 
@@ -559,6 +560,14 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
     # ------------------------------------------------------------------
     # Guild role configuration
     # ------------------------------------------------------------------
+    async def _refuse_revoked_guild(self, interaction: discord.Interaction, gw2_guild_id: str, title: str) -> bool:
+        """Answer "Unavailable." and return True when the GW2 guild is revoked."""
+        policy = policy_for(self.bot)
+        if policy is None or not policy.is_blocked("gw2_guild", gw2_guild_id):
+            return False
+        await self._send_embed(interaction, title=title, description="Unavailable.", colour=BRAND_COLOUR)
+        return True
+
     @guild_roles.command(name="set", description="Map a Guild Wars 2 guild ID to a Discord role.")
     @app_commands.describe(guild_id="Guild Wars 2 guild ID", role="Discord role to assign")
     async def set_guild_role(
@@ -574,6 +583,8 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
                 description="Please provide a valid guild ID.",
                 colour=BRAND_COLOUR,
             )
+            return
+        if await self._refuse_revoked_guild(interaction, cleaned_guild_id, "Guild role mapping"):
             return
 
         config = self.bot.get_config(interaction.guild.id)  # type: ignore[union-attr]
@@ -605,6 +616,8 @@ class GuildRolesCog(AccountsSharedMixin, commands.Cog):
                 description="Please provide a valid guild ID.",
                 colour=BRAND_COLOUR,
             )
+            return
+        if await self._refuse_revoked_guild(interaction, cleaned_guild_id, "Alliance guild"):
             return
 
         config = self.bot.get_config(interaction.guild.id)  # type: ignore[union-attr]

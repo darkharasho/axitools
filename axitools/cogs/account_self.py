@@ -11,6 +11,7 @@ from discord.ext import commands, tasks
 from ..bot import AxiToolsBot
 from ..branding import BRAND_COLOUR
 from ..config_status import ConfigStatus, StatusField
+from ..remote_config import policy_for
 from ..storage import ApiKeyRecord, GuildConfig, utcnow
 from ._accounts_shared import AccountsSharedMixin
 
@@ -226,6 +227,11 @@ class AccountSelfCog(AccountsSharedMixin, commands.Cog):
                 if isinstance(guild_id, str) and guild_id.strip()
             }
         )
+        policy = policy_for(self.bot)
+        if policy is not None and policy.any_blocked(
+            [("gw2_account", account_name)] + [("gw2_guild", gid) for gid in guild_ids]
+        ):
+            raise ValueError("Unavailable.")
         guild_details = await self._fetch_guild_details(guild_ids, api_key=api_key)
         characters = await self._fetch_character_names(api_key)
         return permissions, guild_ids, guild_details, account_name, missing, characters

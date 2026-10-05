@@ -25,6 +25,7 @@ import aiohttp
 import discord
 from aiohttp import web
 
+from ..remote_config import policy_for
 from ..storage import (
     BuildRecord,
     CompPreset,
@@ -182,6 +183,32 @@ async def _auth_middleware(request: web.Request, handler):
     path_guild_id = request.match_info.get("guild_id")
     if path_guild_id is not None and int(path_guild_id) != guild_id:
         return web.json_response({"error": "key is scoped to another server"}, status=403)
+    return await handler(request)
+
+
+_UNAVAILABLE = {"error": "unavailable"}
+
+
+@web.middleware
+async def _policy_middleware(request: web.Request, handler):
+    """Refuse requests for Discord servers on the Axi access denylist.
+
+    Runs after _auth_middleware, so an unauthenticated caller still gets 401
+    and learns nothing about the list. API callers carry no Discord user
+    identity, so only servers can be refused here.
+    """
+    policy = policy_for(request.app["bot"])
+    if policy is not None:
+        guild_ids = set()
+        scope = request.get("bridge_scope")
+        if scope:
+            guild_ids.add(scope[0])
+        if request.get("scoped_guild_id") is not None:
+            guild_ids.add(request["scoped_guild_id"])
+        if request.match_info.get("guild_id") is not None:
+            guild_ids.add(request.match_info["guild_id"])
+        if any(policy.is_blocked("discord_server", str(gid)) for gid in guild_ids):
+            return web.json_response(_UNAVAILABLE, status=403)
     return await handler(request)
 
 
@@ -1541,6 +1568,9 @@ async def _handle_alliance_put(request: web.Request) -> web.Response:
                     {"error": "guild_id must be a Guild Wars 2 guild id"}, status=400
                 )
             updates["alliance_guild_id"] = cleaned
+            policy = policy_for(request.app["bot"])
+            if policy is not None and policy.is_blocked("gw2_guild", cleaned):
+                return web.json_response(_UNAVAILABLE, status=403)
 
     if "guild_name" in body:
         raw = body["guild_name"]
@@ -1666,6 +1696,9 @@ async def _handle_guild_roles_put(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "gw2_guild_id must be a Guild Wars 2 guild id"}, status=400
         )
+    policy = policy_for(request.app["bot"])
+    if policy is not None and policy.is_blocked("gw2_guild", gw2_guild_id):
+        return web.json_response(_UNAVAILABLE, status=403)
     body = await _parse_json_body(request)
     if body is None:
         return web.json_response({"error": "invalid JSON body"}, status=400)
@@ -1883,7 +1916,7 @@ def build_app(bot, token: str) -> web.Application:
     # also means MAX_BRIDGE_ATTACHMENTS x MAX_BRIDGE_ATTACHMENT_BYTES is no
     # longer independently reachable: the body cap binds first.
     app = web.Application(
-        middlewares=[_auth_middleware],
+        middlewares=[_auth_middleware, _policy_middleware],
         client_max_size=MAX_BRIDGE_ATTACHMENT_BYTES + 1024 * 1024,
     )
     app["bot"] = bot
