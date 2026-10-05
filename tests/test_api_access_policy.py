@@ -84,3 +84,29 @@ async def test_alliance_refuses_a_revoked_gw2_guild(client):
     resp = await client.put(f"/guilds/{OTHER}/alliance", headers=AUTH, json={"guild_id": GW2_GUILD.upper()})
     assert resp.status == 403
     assert await resp.json() == {"error": "unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_scoped_app_key_for_a_revoked_server_gets_403(aiohttp_client, tmp_path):
+    from axitools.api.server import hash_app_key
+
+    bot = FakeBot(tmp_path)
+    key = "axt1.aHR0cHM6Ly9leGFtcGxlLnRlc3Q.secret"
+    bot.storage.add_app_key(SERVER, hash_app_key(key), 1)
+    client = await aiohttp_client(build_app(bot, token="test-token"))
+    resp = await client.get(f"/guilds/{SERVER}/config", headers={"Authorization": f"Bearer {key}"})
+    assert resp.status == 403
+    assert await resp.json() == {"error": "unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_bridge_key_for_a_revoked_server_gets_403(aiohttp_client, tmp_path):
+    from axitools.api.server import hash_app_key
+
+    bot = FakeBot(tmp_path)
+    key = "axb1.aHR0cHM6Ly9leGFtcGxlLnRlc3Q.secret"
+    bot.storage.add_bridge_key(SERVER, 5, hash_app_key(key), 1)
+    client = await aiohttp_client(build_app(bot, token="test-token"))
+    resp = await client.get("/bridge/whoami", headers={"Authorization": f"Bearer {key}"})
+    assert resp.status == 403
+    assert await resp.json() == {"error": "unavailable"}

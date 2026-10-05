@@ -22,6 +22,7 @@ from discord.ext import commands, tasks
 from ..bot import AxiToolsBot
 from ..branding import BRAND_COLOUR
 from ..constants import WVW_ALLIANCE_SHEET_GIDS, WVW_ALLIANCE_SHEET_TABS, WVW_SERVER_NAMES
+from ..remote_config import policy_for
 from ..storage import GuildConfig, normalise_guild_id, utcnow
 
 LOGGER = logging.getLogger(__name__)
@@ -1274,6 +1275,12 @@ class AllianceMatchupCog(commands.GroupCog, name="alliance", group_extras={"cate
             await interaction.followup.send("No guild found with that name.", ephemeral=True)
             return
         guild_id, guild_label = lookup
+        policy = policy_for(self.bot)
+        if policy is not None and policy.any_blocked(
+            [("gw2_guild", guild_id), ("discord_server", str(interaction.guild.id))]
+        ):
+            await interaction.followup.send("Unavailable.", ephemeral=True)
+            return
         config = self.bot.get_config(interaction.guild.id)
         config.alliance_guild_id = guild_id
         config.alliance_guild_name = guild_label

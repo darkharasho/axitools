@@ -77,6 +77,17 @@ Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-net
 3. Regenerate keys with `/config apikey generate` — they now point everyone
    at the tunnel.
 
+## Access
+
+Access to the Axi suite, this bot included, can be revoked for people, guilds or servers that violate the terms of use.
+
+- The bot reads a denylist from the axi-config manifest at `AXI_CONFIG_URL` (default `https://config.axi.link`; set it to `off` to disable the check).
+- The list holds only SHA-256 hashes of identifiers. The bot compares hashes, so the list names nobody.
+- No telemetry is sent, and matches are not reported anywhere.
+- If the config service is unreachable, the bot keeps working (it fails open) and retries every five minutes.
+- A revoked user sees "Unavailable." The bot leaves revoked servers.
+- To appeal, use the contact link published by the Axi apps.
+
 ## Project structure
 
 ```

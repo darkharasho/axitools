@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from typing import Iterable, Set
+from urllib.parse import urlsplit
 
 import discord
 from discord import app_commands
@@ -15,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from .api.server import start_api
-from .remote_config import REFRESH_SECONDS, RemoteConfig, policy_for
+from .remote_config import REFRESH_SECONDS, RemoteConfig, refuse_if_revoked
 from .storage import DEFAULT_STORAGE_ROOT, GuildConfig, StorageManager
 
 LOGGER = logging.getLogger(__name__)
@@ -30,19 +31,7 @@ class AxiCommandTree(app_commands.CommandTree):
     """Command tree that refuses users and servers on the Axi access denylist."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        policy = policy_for(self.client)
-        if policy is None:
-            return True
-        identities = [("discord_user", str(interaction.user.id))]
-        if interaction.guild_id is not None:
-            identities.append(("discord_server", str(interaction.guild_id)))
-        if not policy.any_blocked(identities):
-            return True
-        try:
-            await interaction.response.send_message("Unavailable.", ephemeral=True)
-        except discord.HTTPException:
-            LOGGER.debug("Could not answer a refused interaction", exc_info=True)
-        return False
+        return not await refuse_if_revoked(self.client, interaction)
 
 
 class AxiToolsBot(commands.Bot):
@@ -102,6 +91,10 @@ class AxiToolsBot(commands.Bot):
 
         # Load the access denylist before the API accepts requests. refresh()
         # never raises and times out after 10 s; on failure nothing is refused.
+        if self.remote_config.enabled:
+            LOGGER.info("Access policy enabled (config host: %s)", urlsplit(self.remote_config.url).netloc)
+        else:
+            LOGGER.info("Access policy disabled (AXI_CONFIG_URL is off)")
         await self.remote_config.refresh()
         self._policy_task = asyncio.create_task(self._policy_loop())
 

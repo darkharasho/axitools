@@ -74,8 +74,16 @@ class AdminApi:
         return await self._request("GET", "/v1/admin/bans")
 
 
+REASON_LIMIT = 200
+
+
 def _describe(ban: dict[str, Any]) -> str:
-    reason = f" — {ban['reason']}" if ban.get("reason") else ""
+    reason = ""
+    if ban.get("reason"):
+        text = str(ban["reason"])
+        if len(text) > REASON_LIMIT:
+            text = text[: REASON_LIMIT - 1] + "…"
+        reason = f" — {text}"
     return f"`{ban.get('id')}` {ban.get('kind')} `{ban.get('value')}`{reason}"
 
 
@@ -111,7 +119,7 @@ class AccessAdminCog(commands.Cog):
         if result is None:
             return
         verb = "Revoked" if result.get("created") else "Already revoked"
-        await interaction.followup.send(f"{verb}: {_describe(result.get('ban') or {})}", ephemeral=True)
+        await interaction.followup.send(f"{verb}: {_describe(result.get('ban') or {})}"[:MESSAGE_LIMIT], ephemeral=True)
 
     @access.command(name="revoke", description="Revoke access for an identifier.")
     @app_commands.describe(kind="What kind of identifier", value="The identifier", reason="Private note")
@@ -143,7 +151,7 @@ class AccessAdminCog(commands.Cog):
         if result is None:
             return
         verb = "Restored" if result.get("changed") else "Already restored"
-        await interaction.followup.send(f"{verb}: {_describe(result.get('ban') or {})}", ephemeral=True)
+        await interaction.followup.send(f"{verb}: {_describe(result.get('ban') or {})}"[:MESSAGE_LIMIT], ephemeral=True)
 
     @access.command(name="list", description="List active bans.")
     async def list_cmd(self, interaction: discord.Interaction) -> None:

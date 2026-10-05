@@ -115,3 +115,12 @@ async def test_policy_tick_never_raises(bot, caplog):
     bot.remote_config.refresh = AsyncMock(side_effect=RuntimeError("bug"))
     await bot._policy_tick()
     assert "Access policy refresh failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_revoked_autocomplete_is_refused_without_sending(bot):
+    bot.remote_config.set_denylist([hash_identity("discord_user", str(USER))])
+    interaction = _interaction(USER, None)
+    interaction.type = discord.InteractionType.autocomplete
+    assert await bot.tree.interaction_check(interaction) is False
+    interaction.response.send_message.assert_not_awaited()

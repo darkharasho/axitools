@@ -18,6 +18,10 @@ from ._accounts_shared import AccountsSharedMixin
 LOGGER = logging.getLogger(__name__)
 
 
+class AccessUnavailableError(ValueError):
+    """The key's account or GW2 guild is revoked. Callers must not log who matched."""
+
+
 class AccountSelfCog(AccountsSharedMixin, commands.Cog):
     """Manage your own Guild Wars 2 API keys and preferred guild roles."""
 
@@ -109,6 +113,8 @@ class AccountSelfCog(AccountsSharedMixin, commands.Cog):
                 ) = await self._validate_api_key(
                     record.key, allow_missing_permissions=True
                 )
+            except AccessUnavailableError:
+                continue  # revoked: skip quietly, never log who matched
             except ValueError as exc:
                 guild_name = guild_obj.name if guild_obj else "Unknown Guild"
                 user_obj = self.bot.get_user(user_id)
@@ -231,7 +237,7 @@ class AccountSelfCog(AccountsSharedMixin, commands.Cog):
         if policy is not None and policy.any_blocked(
             [("gw2_account", account_name)] + [("gw2_guild", gid) for gid in guild_ids]
         ):
-            raise ValueError("Unavailable.")
+            raise AccessUnavailableError("Unavailable.")
         guild_details = await self._fetch_guild_details(guild_ids, api_key=api_key)
         characters = await self._fetch_character_names(api_key)
         return permissions, guild_ids, guild_details, account_name, missing, characters

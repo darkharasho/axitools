@@ -70,3 +70,35 @@ async def test_guild_role_setup_refuses_a_revoked_guild(command):
     await getattr(cog, command).callback(cog, *args)
     bot.save_config.assert_not_called()
     assert cog._send_embed.await_args.kwargs["description"] == "Unavailable."
+
+
+@pytest.mark.asyncio
+async def test_refresh_loop_skips_a_revoked_key_without_logging(caplog):
+    bot = _bot([hash_identity("gw2_account", "Name.1234")])
+    cog = _account_cog(bot, {"name": "Name.1234", "guilds": []})
+    record = MagicMock(key="KEY")
+    record.name = "Key"
+    bot.storage.all_api_keys.return_value = [(1, 2, record)]
+    bot.get_guild.return_value.get_member.return_value = MagicMock()
+    with caplog.at_level("DEBUG"):
+        await cog._refresh_member_cache()
+    bot.storage.upsert_api_key.assert_not_called()
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_alliance_setup_guild_refuses_a_revoked_gw2_guild():
+    from axitools.cogs.wvw_alliance import AllianceMatchupCog
+
+    bot = _bot([hash_identity("gw2_guild", GUILD)])
+    bot.wait_until_ready = AsyncMock()
+    cog = AllianceMatchupCog(bot)
+    cog._poster_loop.cancel()
+    cog._lookup_guild = AsyncMock(return_value=(GUILD, "Some Guild"))
+    interaction = MagicMock()
+    interaction.guild.id = 1
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    await cog.set_guild.callback(cog, interaction, "Some Guild")
+    bot.save_config.assert_not_called()
+    interaction.followup.send.assert_awaited_once_with("Unavailable.", ephemeral=True)

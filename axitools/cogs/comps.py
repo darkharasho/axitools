@@ -19,6 +19,7 @@ from .. import constants
 from ..bot import AxiToolsBot
 from ..branding import BRAND_COLOUR
 from ..config_status import ConfigStatus, StatusField
+from ..remote_config import refuse_if_revoked
 from ..storage import CompClassConfig, CompConfig, CompSchedule, CompPreset, GuildConfig, normalise_timezone
 
 LOGGER = logging.getLogger(__name__)
@@ -265,6 +266,10 @@ class CompSignupView(discord.ui.View):
         self.schedule_id = schedule_id
         self.channel = channel
         self.add_item(CompSignupSelect(self))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Persistent view: registered with add_view, so it bypasses the command tree.
+        return not await refuse_if_revoked(self.cog.bot, interaction)
 
 
 class CompSignupSelect(discord.ui.Select):

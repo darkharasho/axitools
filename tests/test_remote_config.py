@@ -136,3 +136,10 @@ async def test_refresh_is_a_noop_when_disabled():
     with aioresponses() as m:
         assert await policy.refresh() is False
         assert m.requests == {}
+
+
+def test_lone_surrogate_hashes_like_javascript_text_encoder():
+    # JS TextEncoder replaces a lone surrogate with U+FFFD instead of raising.
+    assert hash_identity("gw2_account", "a\ud800b.1234") == hash_identity("gw2_account", "a�b.1234")
+    assert try_hash_identity("gw2_account", "a\ud800b.1234") is not None
+    assert RemoteConfig(None).is_blocked("gw2_account", "a\ud800b.1234") is False

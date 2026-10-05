@@ -137,3 +137,29 @@ async def test_setup_registers_only_in_the_admin_guild(monkeypatch):
     assert bot.add_cog.await_args.kwargs["guild"] == discord.Object(id=444444444444444444)
     assert cog.owner_id == OWNER
     assert cog.api.base_url == "https://config.axi.link"
+
+
+@pytest.mark.asyncio
+async def test_long_reason_is_truncated_in_list_and_confirmations():
+    cog = _cog()
+    long_ban = {**BAN, "reason": "r" * 6000}
+    interaction = _interaction()
+    with aioresponses() as m:
+        m.get(f"{BASE}/v1/admin/bans", payload={"bans": [long_ban]})
+        await cog.list_cmd.callback(cog, interaction)
+    text = interaction.followup.send.await_args.args[0]
+    assert len(text) <= 2000
+    assert "…" in text
+    assert "b_abcdefghij" in text
+
+    interaction = _interaction()
+    with aioresponses() as m:
+        m.post(f"{BASE}/v1/admin/bans", payload={"ban": long_ban, "created": True}, status=201)
+        await cog.revoke.callback(cog, interaction, app_commands.Choice(name="GW2 account", value="gw2_account"), "Name.1234", "r" * 6000)
+    assert len(interaction.followup.send.await_args.args[0]) <= 2000
+
+    interaction = _interaction()
+    with aioresponses() as m:
+        m.delete(f"{BASE}/v1/admin/bans/b_abcdefghij", payload={"ban": long_ban, "changed": True})
+        await cog.restore.callback(cog, interaction, "b_abcdefghij")
+    assert len(interaction.followup.send.await_args.args[0]) <= 2000

@@ -21,6 +21,7 @@ import unicodedata
 from typing import Any, Iterable
 
 import aiohttp
+import discord
 
 LOGGER = logging.getLogger(__name__)
 
@@ -67,7 +68,9 @@ def normalize_identity(kind: str, value: str) -> str:
 
 
 def _hash_normalized(kind: str, normalized: str) -> str:
-    return hashlib.sha256(f"{kind}:{normalized}".encode("utf-8")).hexdigest()
+    # JS TextEncoder turns a lone surrogate into U+FFFD; strict UTF-8 would raise.
+    text = f"{kind}:{normalized}".encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def hash_identity(kind: str, value: str) -> str:
@@ -161,6 +164,30 @@ def policy_for(obj: Any) -> RemoteConfig | None:
     return policy if isinstance(policy, RemoteConfig) else None
 
 
+async def refuse_if_revoked(client: Any, interaction: discord.Interaction) -> bool:
+    """Answer "Unavailable." and return True when the user or server is revoked.
+
+    Shared by the command tree and by persistent views, which bypass the tree.
+    An autocomplete interaction cannot receive a message, so it is refused
+    silently. Returns False (nothing sent) when the interaction may proceed.
+    """
+    policy = policy_for(client)
+    if policy is None:
+        return False
+    identities = [("discord_user", str(interaction.user.id))]
+    if interaction.guild_id is not None:
+        identities.append(("discord_server", str(interaction.guild_id)))
+    if not policy.any_blocked(identities):
+        return False
+    if interaction.type is discord.InteractionType.autocomplete:
+        return True
+    try:
+        await interaction.response.send_message("Unavailable.", ephemeral=True)
+    except discord.HTTPException:
+        LOGGER.debug("Could not answer a refused interaction", exc_info=True)
+    return True
+
+
 __all__ = [
     "DEFAULT_BASE_URL",
     "FETCH_TIMEOUT_SECONDS",
@@ -171,5 +198,6 @@ __all__ = [
     "hash_identity",
     "normalize_identity",
     "policy_for",
+    "refuse_if_revoked",
     "try_hash_identity",
 ]
