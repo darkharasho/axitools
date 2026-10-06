@@ -235,3 +235,34 @@ async def test_setup_treats_blank_bot_token_as_missing(monkeypatch):
     bot.add_cog = AsyncMock()
     await access_admin.setup(bot)
     bot.add_cog.assert_not_awaited()
+
+
+_NOT_LOADED = "access_admin not loaded: AXI_ADMIN_GUILD_ID, AXI_OWNER_ID and AXI_CONFIG_BOT_TOKEN are required"
+
+
+@pytest.mark.asyncio
+async def test_setup_warns_when_only_partly_configured(monkeypatch, caplog):
+    monkeypatch.setenv("AXI_ADMIN_GUILD_ID", "444444444444444444")
+    monkeypatch.setenv("AXI_OWNER_ID", str(OWNER))
+    monkeypatch.delenv("AXI_CONFIG_BOT_TOKEN", raising=False)
+    bot = MagicMock()
+    bot.add_cog = AsyncMock()
+    with caplog.at_level("INFO", logger=access_admin.LOGGER.name):
+        await access_admin.setup(bot)
+    bot.add_cog.assert_not_awaited()
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert [r.getMessage() for r in warnings] == [_NOT_LOADED]
+
+
+@pytest.mark.asyncio
+async def test_setup_stays_at_info_when_nothing_is_configured(monkeypatch, caplog):
+    monkeypatch.setenv("AXI_ADMIN_GUILD_ID", "   ")
+    monkeypatch.delenv("AXI_OWNER_ID", raising=False)
+    monkeypatch.delenv("AXI_CONFIG_BOT_TOKEN", raising=False)
+    bot = MagicMock()
+    bot.add_cog = AsyncMock()
+    with caplog.at_level("INFO", logger=access_admin.LOGGER.name):
+        await access_admin.setup(bot)
+    bot.add_cog.assert_not_awaited()
+    assert [r.levelname for r in caplog.records if r.getMessage() == _NOT_LOADED] == ["INFO"]
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]

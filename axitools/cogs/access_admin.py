@@ -192,7 +192,9 @@ async def setup(bot: commands.Bot) -> None:
     owner_id = os.getenv("AXI_OWNER_ID", "").strip()
     token = os.getenv("AXI_CONFIG_BOT_TOKEN", "").strip()
     if not (guild_id.isdigit() and owner_id.isdigit() and token):
-        LOGGER.info("access_admin not loaded: AXI_ADMIN_GUILD_ID, AXI_OWNER_ID and AXI_CONFIG_BOT_TOKEN are required")
+        # A partial config (e.g. a forgotten bot token) is likely a mistake; none set is a deliberate opt-out.
+        level = logging.WARNING if (guild_id or owner_id or token) else logging.INFO
+        LOGGER.log(level, "access_admin not loaded: AXI_ADMIN_GUILD_ID, AXI_OWNER_ID and AXI_CONFIG_BOT_TOKEN are required")
         return
     base_url = os.getenv("AXI_CONFIG_URL", "").strip()
     if not base_url or base_url.lower() == "off":
