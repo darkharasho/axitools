@@ -2,10 +2,12 @@
 
 Access can be revoked for people, GW2 guilds and Discord servers that violate
 the Axi apps' terms of use (see README, "Access"). These commands call the
-axi-config admin API. They are registered only in the author's private admin
+axi-config admin API with the dedicated bot token, and send the operator's
+Discord id as `X-Axi-Actor: discord:<id>` on every write so the API's audit log
+records who acted. They are registered only in the author's private admin
 server (AXI_ADMIN_GUILD_ID), answer only AXI_OWNER_ID, and reply ephemerally,
 because the list holds personal identifiers and reasons. The cog is not loaded
-unless AXI_ADMIN_GUILD_ID, AXI_OWNER_ID and AXI_CONFIG_ADMIN_TOKEN are all set.
+unless AXI_ADMIN_GUILD_ID, AXI_OWNER_ID and AXI_CONFIG_BOT_TOKEN are all set.
 """
 from __future__ import annotations
 
@@ -44,14 +46,23 @@ class AdminApi:
         self.base_url = base_url.rstrip("/")
         self._token = token
 
-    async def _request(self, method: str, path: str, body: dict | None = None) -> dict[str, Any]:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        actor: int | str | None = None,
+    ) -> dict[str, Any]:
+        headers = {"Authorization": f"Bearer {self._token}"}
+        if actor is not None:
+            headers["X-Axi-Actor"] = f"discord:{actor}"
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.request(
                 method,
                 self.base_url + path,
                 json=body,
-                headers={"Authorization": f"Bearer {self._token}"},
+                headers=headers,
             ) as resp:
                 try:
                     data = await resp.json(content_type=None)
@@ -62,13 +73,13 @@ class AdminApi:
                     raise AdminApiError(code if isinstance(code, str) else f"HTTP {resp.status}")
                 return data if isinstance(data, dict) else {}
 
-    async def ban(self, kind: str, value: str, reason: str | None, created_by: str) -> dict[str, Any]:
+    async def ban(self, kind: str, value: str, reason: str | None, actor_id: int | str) -> dict[str, Any]:
         return await self._request(
-            "POST", "/v1/admin/bans", {"kind": kind, "value": value, "reason": reason, "createdBy": created_by}
+            "POST", "/v1/admin/bans", {"kind": kind, "value": value, "reason": reason}, actor=actor_id
         )
 
-    async def unban(self, ban_id: str) -> dict[str, Any]:
-        return await self._request("DELETE", f"/v1/admin/bans/{quote(ban_id, safe='')}")
+    async def unban(self, ban_id: str, actor_id: int | str) -> dict[str, Any]:
+        return await self._request("DELETE", f"/v1/admin/bans/{quote(ban_id, safe='')}", actor=actor_id)
 
     async def list_bans(self) -> dict[str, Any]:
         return await self._request("GET", "/v1/admin/bans")
@@ -114,7 +125,7 @@ class AccessAdminCog(commands.Cog):
 
     async def _ban(self, interaction: discord.Interaction, kind: str, value: str, reason: str | None) -> None:
         result = await self._call(
-            interaction, "Revoke", self.api.ban(kind, value, reason, str(interaction.user.id))
+            interaction, "Revoke", self.api.ban(kind, value, reason, interaction.user.id)
         )
         if result is None:
             return
@@ -147,7 +158,7 @@ class AccessAdminCog(commands.Cog):
     async def restore(self, interaction: discord.Interaction, ban_id: str) -> None:
         if not await self._owner_only(interaction):
             return
-        result = await self._call(interaction, "Restore", self.api.unban(ban_id))
+        result = await self._call(interaction, "Restore", self.api.unban(ban_id, interaction.user.id))
         if result is None:
             return
         verb = "Restored" if result.get("changed") else "Already restored"
@@ -179,9 +190,9 @@ class AccessAdminCog(commands.Cog):
 async def setup(bot: commands.Bot) -> None:
     guild_id = os.getenv("AXI_ADMIN_GUILD_ID", "").strip()
     owner_id = os.getenv("AXI_OWNER_ID", "").strip()
-    token = os.getenv("AXI_CONFIG_ADMIN_TOKEN", "").strip()
+    token = os.getenv("AXI_CONFIG_BOT_TOKEN", "").strip()
     if not (guild_id.isdigit() and owner_id.isdigit() and token):
-        LOGGER.info("access_admin not loaded: AXI_ADMIN_GUILD_ID, AXI_OWNER_ID and AXI_CONFIG_ADMIN_TOKEN are required")
+        LOGGER.info("access_admin not loaded: AXI_ADMIN_GUILD_ID, AXI_OWNER_ID and AXI_CONFIG_BOT_TOKEN are required")
         return
     base_url = os.getenv("AXI_CONFIG_URL", "").strip()
     if not base_url or base_url.lower() == "off":

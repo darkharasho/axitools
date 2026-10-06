@@ -50,8 +50,10 @@ async def test_revoke_posts_to_the_admin_api():
         m.post(f"{BASE}/v1/admin/bans", payload={"ban": BAN, "created": True}, status=201)
         await cog.revoke.callback(cog, interaction, app_commands.Choice(name="GW2 account", value="gw2_account"), "Name.1234", "spam")
         request = list(m.requests.values())[0][0]
-        assert request.kwargs["json"] == {"kind": "gw2_account", "value": "Name.1234", "reason": "spam", "createdBy": str(OWNER)}
+        assert request.kwargs["json"] == {"kind": "gw2_account", "value": "Name.1234", "reason": "spam"}
+        assert "createdBy" not in request.kwargs["json"]
         assert request.kwargs["headers"]["Authorization"] == "Bearer " + "t" * 40
+        assert request.kwargs["headers"]["X-Axi-Actor"] == f"discord:{OWNER}"
     text = interaction.followup.send.await_args.args[0]
     assert text.startswith("Revoked")
     assert "b_abcdefghij" in text
@@ -116,7 +118,7 @@ async def test_list_stays_under_discords_message_limit():
 
 @pytest.mark.asyncio
 async def test_setup_skips_without_configuration(monkeypatch):
-    for name in ("AXI_ADMIN_GUILD_ID", "AXI_OWNER_ID", "AXI_CONFIG_ADMIN_TOKEN"):
+    for name in ("AXI_ADMIN_GUILD_ID", "AXI_OWNER_ID", "AXI_CONFIG_BOT_TOKEN", "AXI_CONFIG_ADMIN_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     bot = MagicMock()
     bot.add_cog = AsyncMock()
@@ -128,7 +130,8 @@ async def test_setup_skips_without_configuration(monkeypatch):
 async def test_setup_registers_only_in_the_admin_guild(monkeypatch):
     monkeypatch.setenv("AXI_ADMIN_GUILD_ID", "444444444444444444")
     monkeypatch.setenv("AXI_OWNER_ID", str(OWNER))
-    monkeypatch.setenv("AXI_CONFIG_ADMIN_TOKEN", "t" * 40)
+    monkeypatch.setenv("AXI_CONFIG_BOT_TOKEN", "b" * 40)
+    monkeypatch.delenv("AXI_CONFIG_ADMIN_TOKEN", raising=False)
     monkeypatch.delenv("AXI_CONFIG_URL", raising=False)
     bot = MagicMock()
     bot.add_cog = AsyncMock()
@@ -137,6 +140,7 @@ async def test_setup_registers_only_in_the_admin_guild(monkeypatch):
     assert bot.add_cog.await_args.kwargs["guild"] == discord.Object(id=444444444444444444)
     assert cog.owner_id == OWNER
     assert cog.api.base_url == "https://config.axi.link"
+    assert cog.api._token == "b" * 40
 
 
 @pytest.mark.asyncio
@@ -163,3 +167,71 @@ async def test_long_reason_is_truncated_in_list_and_confirmations():
         m.delete(f"{BASE}/v1/admin/bans/b_abcdefghij", payload={"ban": long_ban, "changed": True})
         await cog.restore.callback(cog, interaction, "b_abcdefghij")
     assert len(interaction.followup.send.await_args.args[0]) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_restore_sends_the_actor_header():
+    cog = _cog()
+    interaction = _interaction()
+    with aioresponses() as m:
+        m.delete(f"{BASE}/v1/admin/bans/b_abcdefghij", payload={"ban": {**BAN, "revokedAt": "x"}, "changed": True})
+        await cog.restore.callback(cog, interaction, "b_abcdefghij")
+        request = list(m.requests.values())[0][0]
+        assert request.kwargs["headers"]["X-Axi-Actor"] == f"discord:{OWNER}"
+        assert request.kwargs["headers"]["Authorization"] == "Bearer " + "t" * 40
+        assert request.kwargs.get("json") is None
+    assert interaction.followup.send.await_args.args[0].startswith("Restored")
+
+
+@pytest.mark.asyncio
+async def test_list_sends_no_actor_header():
+    cog = _cog()
+    interaction = _interaction()
+    with aioresponses() as m:
+        m.get(f"{BASE}/v1/admin/bans", payload={"bans": []})
+        await cog.list_cmd.callback(cog, interaction)
+        request = list(m.requests.values())[0][0]
+        assert "X-Axi-Actor" not in request.kwargs["headers"]
+        assert request.kwargs["headers"]["Authorization"] == "Bearer " + "t" * 40
+    assert interaction.followup.send.await_args.args[0] == "No active bans."
+
+
+@pytest.mark.asyncio
+async def test_revoke_user_actor_is_the_operator_not_the_target():
+    cog = _cog()
+    user = MagicMock(spec=discord.User)
+    user.id = 333333333333333333
+    with aioresponses() as m:
+        m.post(f"{BASE}/v1/admin/bans", payload={"ban": {**BAN, "kind": "discord_user", "value": "333333333333333333"}, "created": True}, status=201)
+        interaction = _interaction()
+        await cog.revoke_user.callback(cog, interaction, user, None)
+        request = list(m.requests.values())[0][0]
+        assert request.kwargs["json"] == {"kind": "discord_user", "value": "333333333333333333", "reason": None}
+        assert request.kwargs["headers"]["X-Axi-Actor"] == f"discord:{OWNER}"
+
+
+@pytest.mark.asyncio
+async def test_setup_ignores_the_old_admin_token(monkeypatch, caplog):
+    monkeypatch.setenv("AXI_ADMIN_GUILD_ID", "444444444444444444")
+    monkeypatch.setenv("AXI_OWNER_ID", str(OWNER))
+    monkeypatch.setenv("AXI_CONFIG_ADMIN_TOKEN", "t" * 40)
+    monkeypatch.delenv("AXI_CONFIG_BOT_TOKEN", raising=False)
+    bot = MagicMock()
+    bot.add_cog = AsyncMock()
+    with caplog.at_level("INFO", logger=access_admin.LOGGER.name):
+        await access_admin.setup(bot)
+    bot.add_cog.assert_not_awaited()
+    assert "AXI_CONFIG_BOT_TOKEN" in caplog.text
+    assert "t" * 40 not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_setup_treats_blank_bot_token_as_missing(monkeypatch):
+    monkeypatch.setenv("AXI_ADMIN_GUILD_ID", "444444444444444444")
+    monkeypatch.setenv("AXI_OWNER_ID", str(OWNER))
+    monkeypatch.setenv("AXI_CONFIG_BOT_TOKEN", "   ")
+    monkeypatch.delenv("AXI_CONFIG_ADMIN_TOKEN", raising=False)
+    bot = MagicMock()
+    bot.add_cog = AsyncMock()
+    await access_admin.setup(bot)
+    bot.add_cog.assert_not_awaited()
