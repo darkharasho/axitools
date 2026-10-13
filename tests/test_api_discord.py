@@ -95,6 +95,7 @@ class FakeGuild:
         self.id = guild_id
         self.name = name
         self.member_count = 0
+        self.owner_id = 30
         self.categories = []
         self.channels = []
         self.roles = []
@@ -190,7 +191,9 @@ async def test_snapshot_shape(api_client):
     assert resp.status == 200
     body = await resp.json()
     # Snowflake ids (and the 64-bit permissions bitfield) serialize as strings.
-    assert body["guild"] == {"id": "123", "name": "Vigil Keep", "member_count": 2}
+    assert body["guild"] == {
+        "id": "123", "name": "Vigil Keep", "member_count": 2, "owner_id": "30",
+    }
     assert body["categories"] == [{"id": "10", "name": "Operations", "position": 0}]
     # Categories are excluded from the flat channel list; other channel kinds
     # (e.g. forums) are included.

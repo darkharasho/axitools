@@ -886,6 +886,9 @@ async def _handle_discord_snapshot(request: web.Request) -> web.Response:
             "id": _sid(guild.id),
             "name": guild.name,
             "member_count": guild.member_count,
+            # Lets callers (AxiRoster's role-hierarchy guard) treat the owner,
+            # who outranks every role, as such even with no roles.
+            "owner_id": _sid(getattr(guild, "owner_id", None)),
         },
         "categories": [
             {"id": _sid(c.id), "name": c.name, "position": getattr(c, "position", 0)}
