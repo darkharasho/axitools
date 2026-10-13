@@ -56,24 +56,36 @@ release_host() {
   local entry
   entry=$(jq -c --arg name "$name" '.hosts[] | select(.name == $name)' "$CONFIG_FILE")
 
-  local ssh_host ssh_user remote_dir pm2_app auth_mode key_path agent_sock
+  local ssh_host ssh_user remote_dir pm2_app systemd_unit auth_mode key_path agent_sock
   ssh_host=$(jq -r '.ssh_host // empty' <<<"$entry")
   ssh_user=$(jq -r '.ssh_user // empty' <<<"$entry")
   remote_dir=$(jq -r '.remote_dir // empty' <<<"$entry")
   pm2_app=$(jq -r '.pm2_app // empty' <<<"$entry")
+  systemd_unit=$(jq -r '.systemd_unit // empty' <<<"$entry")
   auth_mode=$(jq -r '.ssh_auth_mode // "key"' <<<"$entry")
   key_path=$(jq -r '.ssh_key_path // empty' <<<"$entry")
   agent_sock=$(jq -r '.onepassword_agent_sock // empty' <<<"$entry")
 
-  for field in ssh_host ssh_user remote_dir pm2_app; do
+  for field in ssh_host ssh_user remote_dir; do
     if [[ -z "${!field}" ]]; then
       echo "[$name] missing required field: $field"
       return 1
     fi
   done
 
+  # Restart via a systemd user unit if one is set, else pm2.
+  local restart_cmd
+  if [[ -n "$systemd_unit" ]]; then
+    restart_cmd="systemctl --user restart \"${systemd_unit}\""
+  elif [[ -n "$pm2_app" ]]; then
+    restart_cmd="pm2 restart \"${pm2_app}\""
+  else
+    echo "[$name] missing required field: pm2_app or systemd_unit"
+    return 1
+  fi
+
   local ssh_target="${ssh_user}@${ssh_host}"
-  local remote_cmd="cd \"${remote_dir}\" && git pull && pm2 restart \"${pm2_app}\""
+  local remote_cmd="cd \"${remote_dir}\" && git pull && ${restart_cmd}"
 
   echo "==> [$name] Releasing to ${ssh_target}:${remote_dir}"
   case "$auth_mode" in

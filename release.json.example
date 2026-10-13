@@ -15,7 +15,7 @@
       "ssh_host": "backup.local",
       "ssh_user": "deploy",
       "remote_dir": "/home/deploy/gw2_tools",
-      "pm2_app": "axitools-bot",
+      "systemd_unit": "axitools",
       "ssh_auth_mode": "key",
       "ssh_key_path": "~/.ssh/id_ed25519"
     }
