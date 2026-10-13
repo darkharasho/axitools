@@ -99,7 +99,7 @@ release_host() {
         echo "[$name] SSH key not found at: $key_path"
         return 1
       fi
-      ssh -i "$key_path" "$ssh_target" "$remote_cmd"
+      ssh -n -i "$key_path" "$ssh_target" "$remote_cmd"
       ;;
     onepassword)
       if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
@@ -111,7 +111,7 @@ release_host() {
         fi
         export SSH_AUTH_SOCK="$sock"
       fi
-      ssh "$ssh_target" "$remote_cmd"
+      ssh -n "$ssh_target" "$remote_cmd"
       ;;
     *)
       echo "[$name] Invalid ssh_auth_mode: $auth_mode (expected: key or onepassword)"
