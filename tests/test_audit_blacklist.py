@@ -200,3 +200,59 @@ def test_blacklist_channel_id_autocomplete_matches_name_and_empty():
         cog.audit_blacklist_channel_id_autocomplete(interaction, "")
     )
     assert [c.value for c in all_matches] == ["700", "800"]
+
+
+def _make_pause_interaction(channel_id):
+    interaction = _make_interaction()
+    interaction.channel = MagicMock()
+    interaction.channel.id = channel_id
+    interaction.user = MagicMock()
+    interaction.user.mention = "<@42>"
+    return interaction
+
+
+def test_pause_and_resume_commands_registered():
+    names = {cmd.qualified_name for cmd in AuditCog.audit.walk_commands()}
+    assert {"audit pause", "audit resume"} <= names
+
+
+def test_pause_blacklists_current_channel_and_notifies():
+    cog, config = _make_command_cog([])
+    config.audit_channel_id = 999
+    cog._send_audit_message = AsyncMock()
+    interaction = _make_pause_interaction(700)
+
+    asyncio.run(cog.audit_pause_command.callback(cog, interaction))
+    asyncio.run(cog.audit_pause_command.callback(cog, interaction))
+
+    assert config.audit_channel_blacklist == [700]
+    cog.bot.save_config.assert_called_once()
+    # Only the first (effective) pause is announced in the audit channel.
+    cog._send_audit_message.assert_awaited_once()
+    assert cog._send_audit_message.await_args.args[1] == 999
+
+
+def test_resume_unblacklists_current_channel_and_notifies():
+    cog, config = _make_command_cog([700, 800])
+    config.audit_channel_id = 999
+    cog._send_audit_message = AsyncMock()
+    interaction = _make_pause_interaction(700)
+
+    asyncio.run(cog.audit_resume_command.callback(cog, interaction))
+    asyncio.run(cog.audit_resume_command.callback(cog, interaction))
+
+    assert config.audit_channel_blacklist == [800]
+    cog.bot.save_config.assert_called_once()
+    cog._send_audit_message.assert_awaited_once()
+
+
+def test_pause_without_audit_channel_skips_notice():
+    cog, config = _make_command_cog([])
+    config.audit_channel_id = None
+    cog._send_audit_message = AsyncMock()
+    interaction = _make_pause_interaction(700)
+
+    asyncio.run(cog.audit_pause_command.callback(cog, interaction))
+
+    assert config.audit_channel_blacklist == [700]
+    cog._send_audit_message.assert_not_awaited()

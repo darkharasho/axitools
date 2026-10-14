@@ -554,6 +554,78 @@ class AuditCog(commands.Cog):
             title="Audit blacklist",
         )
 
+    @audit.command(
+        name="pause",
+        description="Pause audit logging in this channel.",
+    )
+    async def audit_pause_command(self, interaction: discord.Interaction) -> None:
+        if not await self.bot.ensure_authorised(interaction):
+            return
+        if interaction.guild is None or interaction.channel is None:
+            return
+
+        channel_id = interaction.channel.id
+        config = self.bot.get_config(interaction.guild.id)
+        if channel_id in config.audit_channel_blacklist:
+            await self._reply(
+                interaction,
+                f"Audit logging is already paused in <#{channel_id}>.",
+            )
+            return
+        config.audit_channel_blacklist.append(channel_id)
+        self.bot.save_config(interaction.guild.id, config)
+        await self._announce_pause_change(interaction, config, paused=True)
+        await self._reply(
+            interaction,
+            f"Audit logging paused in <#{channel_id}>. "
+            "Run `/audit resume` here to turn it back on.",
+        )
+
+    @audit.command(
+        name="resume",
+        description="Resume audit logging in this channel.",
+    )
+    async def audit_resume_command(self, interaction: discord.Interaction) -> None:
+        if not await self.bot.ensure_authorised(interaction):
+            return
+        if interaction.guild is None or interaction.channel is None:
+            return
+
+        channel_id = interaction.channel.id
+        config = self.bot.get_config(interaction.guild.id)
+        if channel_id not in config.audit_channel_blacklist:
+            await self._reply(
+                interaction,
+                f"Audit logging is not paused in <#{channel_id}>.",
+            )
+            return
+        config.audit_channel_blacklist = [
+            cid for cid in config.audit_channel_blacklist if cid != channel_id
+        ]
+        self.bot.save_config(interaction.guild.id, config)
+        await self._announce_pause_change(interaction, config, paused=False)
+        await self._reply(interaction, f"Audit logging resumed in <#{channel_id}>.")
+
+    async def _announce_pause_change(
+        self, interaction: discord.Interaction, config: Any, *, paused: bool
+    ) -> None:
+        """Leave a trail in the audit channel when a channel is paused/resumed."""
+        if interaction.guild is None or interaction.channel is None:
+            return
+        if not config.audit_channel_id:
+            return
+        state = "paused" if paused else "resumed"
+        embed = brand_embed(
+            title=f"Audit logging {state}",
+            description=(
+                f"{interaction.user.mention} {state} audit logging in "
+                f"<#{interaction.channel.id}>."
+            ),
+        )
+        await self._send_audit_message(
+            interaction.guild, config.audit_channel_id, embed
+        )
+
     # ------------------------------------------------------------------
     # Query commands
     # ------------------------------------------------------------------
